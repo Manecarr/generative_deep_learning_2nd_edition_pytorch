@@ -6,7 +6,7 @@ from typing import Callable, Literal
 import torch
 import torchvision
 
-DATA_CACHE_DIR = Path(__name__).parent.parent.joinpath(".cache_data")
+DATA_CACHE_DIR = Path(__name__).parent.parent.joinpath(".cache_data").absolute()
 
 
 def get_cifar10_dataset(
