@@ -6,6 +6,8 @@ from typing import Callable, Literal
 import torch
 import torchvision
 
+DATA_CACHE_DIR = Path(__name__).parent.parent.joinpath(".cache_data")
+
 
 def get_cifar10_dataset(
     split: Literal["train", "val", "both"], save_path: Path, transform: Callable | None, download: bool = False

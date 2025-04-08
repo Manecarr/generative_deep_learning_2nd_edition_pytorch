@@ -5,17 +5,27 @@ repos:
     -   id: check-yaml
     -   id: end-of-file-fixer
     -   id: trailing-whitespace
+    -   id: check-added-large-files
 -   repo: https://github.com/astral-sh/ruff-pre-commit
     # Ruff version.
     rev: v0.11.4
     hooks:
     # Run the linter.
     -   id: ruff
+        name: "ruff linting"
         args: [ --fix ]
     # Run the formatter.
     -   id: ruff-format
+        name: "ruff formatting"
 -   repo: https://github.com/astral-sh/uv-pre-commit
     # uv version.
     rev: 0.6.12
     hooks:
       - id: uv-lock
+-   repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.15.0
+    hooks:
+      - id: mypy
+        name: "check type hints"
+        # Necessary to ignore-missing-imports as the hook runs in an isolated environment
+        args: [--ignore-missing-imports]
