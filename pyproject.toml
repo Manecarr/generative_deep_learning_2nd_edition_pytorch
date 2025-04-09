@@ -9,7 +9,10 @@ dependencies = [
     "matplotlib>=3.10.1",
     "numpy>=2.2.4",
     "pillow>=11.1.0",
+    "standard-imghdr>=3.13.0",
+    "tensorboard>=2.19.0",
     "torch>=2.6.0",
+    "torchinfo>=1.8.0",
     "torchvision>=0.21.0",
 ]
 
