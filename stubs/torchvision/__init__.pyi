@@ -1,6 +1,7 @@
 from modulefinder import Module as Module
 
 from torchvision import datasets as datasets
+from torchvision import transforms as transforms
 from torchvision.version import __version__ as __version__
 
 message: str

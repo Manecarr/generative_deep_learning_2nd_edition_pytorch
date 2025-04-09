@@ -1,0 +1,18 @@
+data:
+  pin_memory: True
+  num_workers: 8
+  batch_size: 32
+  shuffle: True
+model:
+  input_size: 3072
+  num_hidden_neurons:
+      - 200
+      - 150
+  num_outputs: 10
+optimizer:
+  type: torch.optim.Adam
+  lr: 0.0005
+loss_function:
+  type: torch.nn.CrossEntropyLoss
+training:
+  num_epochs: 10
