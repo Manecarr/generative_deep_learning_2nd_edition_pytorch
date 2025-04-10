@@ -1,3 +1,6 @@
+hydra:
+  run:
+    dir: ./outputs/Chapter_02/MLP/${now:%Y-%m-%d}/${now:%H-%M-%S}
 data:
   pin_memory: True
   num_workers: 8
