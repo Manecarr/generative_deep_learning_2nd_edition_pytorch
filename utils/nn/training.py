@@ -1,6 +1,6 @@
 import logging
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 import mlflow
 import torch
@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torchinfo import summary
 
-from utils.metrics.metrics import calculate_accuracy
+from utils.metrics.metrics import calculate_accuracy, calculate_tp_fp_tn_fn
 
 logger = logging.getLogger(__name__)
 
@@ -64,12 +64,12 @@ class Trainer:
         self.loss_fn = loss_fn
         self.device = device
         self.output_dir = output_dir
+        self.experiment_name = experiment_name
 
         self.train_loader: DataLoader = train_loader
         self.val_loader: DataLoader | None = val_loader
 
-        self.train_summary_writer: SummaryWriter
-        self.val_summary_writer: SummaryWriter | None
+        self.summary_writer: SummaryWriter
 
         self.run_cfg = dict(run_cfg)
 
@@ -78,22 +78,20 @@ class Trainer:
         self.current_epoch: int = 0
         self.current_iteration: int = 0
 
+        self.metrics: dict[str, Any] = {}
+
         self.input_shape: tuple[int, ...] = next(iter(train_loader))[0].shape
 
         # Set up experiments details
         run = mlflow.active_run()
         assert run is not None, "An MLFlow run must be active."
         self.run_id = run.info.run_id
-        tb_log_dir = output_dir.joinpath(experiment_name, self.run_id)
+        tb_log_dir = output_dir.joinpath(self.run_id, "tensorboard")
         if not tb_log_dir.is_dir():
             tb_log_dir.mkdir(parents=True)
         else:
             raise FileExistsError(f"Tensorboard log directory {tb_log_dir} already exists.")
-        self.train_summary_writer = SummaryWriter(log_dir=tb_log_dir.joinpath("train"))
-        if val_loader is not None:
-            self.val_summary_writer = SummaryWriter(log_dir=tb_log_dir.joinpath("val"))
-        else:
-            self.val_summary_writer = None
+        self.summary_writer = SummaryWriter(log_dir=tb_log_dir)
         self.train_loader = train_loader
 
         self._log_model()
@@ -104,7 +102,7 @@ class Trainer:
         with self.output_dir.joinpath("model_summary.txt").open("w", encoding="utf-8") as f:
             f.write(str(summary(self.model, input_size=self.input_shape, device=self.device)))
         mlflow.log_artifact(str(self.output_dir.joinpath("model_summary.txt")))
-        # self.train_summary_writer.add_histogram("Model/Weights", self.model.state_dict(), self.current_iteration)
+        # self.summary_writer.add_histogram("Model/Weights", self.model.state_dict(), self.current_iteration)
 
     def train_one_epoch(self) -> None:
         """Train the model for one epoch."""
@@ -142,6 +140,7 @@ class Trainer:
             torch.cat(predictions),
             torch.cat(correct_labels),
         )
+
         train_loss = running_loss / iterations_in_epoch
         logger.info(
             "Epoch: %d, train loss (avg. over epoch): %.3f, train accuracy: %.2f.",
@@ -150,13 +149,13 @@ class Trainer:
             metrics["accuracy"],
         )
 
-        self.train_summary_writer.add_scalar("Loss/Train", train_loss, self.current_iteration)
-        self.train_summary_writer.add_scalar("Accuracy/Train", metrics["accuracy"], self.current_iteration)
-        # self.train_summary_writer.add_histogram("Model/Weights", self.model.state_dict(), self.current_iteration)
-        # Log on mlflow
-        mlflow.log_metrics(
-            {"Loss/Train": train_loss, "Accuracy/Train": metrics["accuracy"]}, step=self.current_iteration
-        )
+        # Store epoch metrics
+        self.metrics["Loss/Train"] = train_loss
+        self.metrics["Accuracy/Train"] = metrics["accuracy"]
+        self.metrics["TPs/Train"] = metrics["TPs"]
+        self.metrics["FPs/Train"] = metrics["FPs"]
+        self.metrics["TPs rel./Train"] = metrics["TPs (%)"]
+        self.metrics["FPs rel./Train"] = metrics["FPs (%)"]
 
     def validate_one_epoch(self) -> None:
         """Run validation on one epoch."""
@@ -193,12 +192,14 @@ class Trainer:
             val_loss,
             metrics["accuracy"],
         )
-        self.train_summary_writer.add_scalar("Loss/Validation", val_loss, self.current_iteration)
-        self.train_summary_writer.add_scalar("Accuracy/Validation", metrics["accuracy"], self.current_iteration)
-        # Log on mlflow
-        mlflow.log_metrics(
-            {"Loss/Validation": val_loss, "Accuracy/Validation": metrics["accuracy"]}, step=self.current_iteration
-        )
+
+        # Store epoch metrics
+        self.metrics["Loss/Validation"] = val_loss
+        self.metrics["Accuracy/Validation"] = metrics["accuracy"]
+        self.metrics["TPs/Validation"] = metrics["TPs"]
+        self.metrics["FPs/Validation"] = metrics["FPs"]
+        self.metrics["TPs rel./Validation"] = metrics["TPs (%)"]
+        self.metrics["FPs rel./Validation"] = metrics["FPs (%)"]
 
     def fit(self) -> None:
         """Train the model."""
@@ -207,10 +208,11 @@ class Trainer:
             self.train_one_epoch()
             if self.val_loader is not None:
                 self.validate_one_epoch()
+            self.log_metrics()
+            self.metrics = {}
+            self.summary_writer.flush()
         logger.info("Training finished.")
-        self.train_summary_writer.close()
-        if self.val_summary_writer is not None:
-            self.val_summary_writer.close()
+        self.summary_writer.close()
 
     def calculate_metrics(self, predictions: Tensor, gts: Tensor) -> dict[str, float]:
         """Calculate the metrics.
@@ -222,7 +224,31 @@ class Trainer:
         metrics_dict: dict[str, float] = {}
         # calculate accuracy
         accuracy = calculate_accuracy(predictions.detach(), gts)
+        # Calculate TPs and FPs
+        tps, fps, _, _, tps_p, fps_p, _, _ = calculate_tp_fp_tn_fn(predictions.detach(), gts)
 
         metrics_dict["accuracy"] = accuracy
+        metrics_dict.update({"TPs": tps, "FPs": fps, "TPs (%)": tps_p, "FPs (%)": fps_p})
 
         return metrics_dict
+
+    def log_metrics(self) -> None:
+        """Log metrics on mlflow and tensorboard.
+
+        .. warning::
+            This method should be only called at the end of an epoch.
+        """
+        # Log to tensorboard
+        metrics_keys = list(self.metrics.keys())
+        metrics_types = set([key.split("/")[0] for key in metrics_keys])
+        for key in metrics_types:
+            train_metrics = self.metrics[key + "/Train"]
+            val_metrics = self.metrics[key + "/Validation"]
+            # For now we log only scalar metrics
+            if isinstance(train_metrics, float) and isinstance(val_metrics, float):
+                self.summary_writer.add_scalars(
+                    key, {"Train": train_metrics, "Validation": val_metrics}, self.current_iteration
+                )
+
+        # Log on mlflow
+        mlflow.log_metrics(self.metrics, step=self.current_iteration)
