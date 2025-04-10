@@ -1,7 +1,8 @@
 import logging
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from functools import partial
 from pathlib import Path
+from typing import Any
 
 import hydra
 import mlflow
@@ -63,12 +64,12 @@ class MLP(torch.nn.Module):
             num_hidden_neurons: the number of neurons in each hidden layer.
         """
         super().__init__()
-        layers = []
+        layers: list[torch.nn.Module] = []
         for i, num_neurons in enumerate(num_hidden_neurons):
             layers.append(torch.nn.Linear(input_size if i == 0 else num_hidden_neurons[i - 1], num_neurons))
             layers.append(torch.nn.ReLU())
         layers.append(torch.nn.Linear(num_neurons, num_outputs))
-        self.layers = torch.nn.Sequential(*layers)
+        self.layers: Callable[[Any], torch.Tensor] = torch.nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass of the model.
