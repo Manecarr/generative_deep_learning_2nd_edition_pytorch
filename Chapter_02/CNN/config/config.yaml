@@ -1,0 +1,38 @@
+hydra:
+  run:
+    dir: ./outputs/Chapter_02/CNN/${now:%Y-%m-%d}/${now:%H-%M-%S}
+data:
+  pin_memory: True
+  num_workers: 8
+  batch_size: 32
+  shuffle: True
+model:
+  input_size:
+    - 3
+    - 32
+    - 32
+  number_of_channels:
+    - 32
+    - 32
+    - 64
+    - 64
+  kernel_sizes:
+    - 3
+    - 3
+    - 3
+    - 3
+  strides:
+    - 1
+    - 2
+    - 1
+    - 2
+  neurons_linear_layer: 128
+  num_outputs: 10
+  dropout_rate: 0.5
+optimizer:
+  type: torch.optim.Adam
+  lr: 0.0005
+loss_function:
+  type: torch.nn.CrossEntropyLoss
+training:
+  num_epochs: 10
