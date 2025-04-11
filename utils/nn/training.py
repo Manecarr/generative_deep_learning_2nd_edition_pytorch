@@ -72,7 +72,7 @@ class Trainer:
 
         self.summary_writer: SummaryWriter
 
-        self.run_cfg = dict(run_cfg)
+        self.run_cfg: dict[str, Any] = dict(run_cfg)
 
         self.run_id: str
         self.total_epochs: int = num_epochs
@@ -84,18 +84,25 @@ class Trainer:
         self.input_shape: tuple[int, ...] = next(iter(train_loader))[0].shape
 
         # Set up experiments details
-        run = mlflow.active_run()
-        assert run is not None, "An MLFlow run must be active."
-        self.run_id = run.info.run_id
-        tb_log_dir = output_dir.joinpath(self.run_id, "tensorboard")
+        tb_log_dir = output_dir.joinpath("tensorboard")
         if not tb_log_dir.is_dir():
             tb_log_dir.mkdir(parents=True)
         else:
             raise FileExistsError(f"Tensorboard log directory {tb_log_dir} already exists.")
         self.summary_writer = SummaryWriter(log_dir=tb_log_dir)
+        self.tensorboard_log_dir = tb_log_dir
         self.train_loader = train_loader
 
         self._log_model()
+
+    def log_model_weights_histogram(self) -> None:
+        """Log the model weights histogram to Tensorboard."""
+        for name, param in self.model.named_parameters():
+            self.summary_writer.add_histogram(name, param.detach().cpu().numpy().flatten(), self.current_iteration)
+            if param.grad is not None:
+                self.summary_writer.add_histogram(
+                    name + "_grad", param.grad.detach().cpu().numpy().flatten(), self.current_iteration
+                )
 
     def _log_model(self) -> None:
         """Log the model specifications to MLFlow."""
@@ -103,7 +110,7 @@ class Trainer:
         with self.output_dir.joinpath("model_summary.txt").open("w", encoding="utf-8") as f:
             f.write(str(summary(self.model, input_size=self.input_shape, device=self.device)))
         mlflow.log_artifact(str(self.output_dir.joinpath("model_summary.txt")))
-        # self.summary_writer.add_histogram("Model/Weights", self.model.state_dict(), self.current_iteration)
+        self.log_model_weights_histogram()
 
     def train_one_epoch(self) -> None:
         """Train the model for one epoch."""
@@ -210,8 +217,11 @@ class Trainer:
             if self.val_loader is not None:
                 self.validate_one_epoch()
             self.log_metrics()
+            self.log_model_weights_histogram()
             self.metrics = {}
             self.summary_writer.flush()
+            # Log tensorboard artifacts in MLFlow
+            mlflow.log_artifact(str(self.tensorboard_log_dir))
         logger.info("Training finished.")
         self.summary_writer.close()
 

@@ -29,6 +29,7 @@ model:
   neurons_linear_layer: 128
   num_outputs: 10
   dropout_rate: 0.5
+  lrelu_neg_slope: 0.3
 optimizer:
   type: torch.optim.Adam
   lr: 0.0005

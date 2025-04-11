@@ -64,6 +64,7 @@ class CNN(torch.nn.Module):
         neurons_linear_layer: int,
         num_outputs: int,
         dropout_rate: float = 0.5,
+        lrelu_neg_slope: float = 0.2,
     ) -> None:
         """Initialize the model.
 
@@ -75,6 +76,7 @@ class CNN(torch.nn.Module):
             neurons_linear_layer: the number of neurons in the linear layer.
             num_outputs: the number of outputs.
             dropout_rate: the dropout rate to use.
+            lrelu_neg_slope: the negative slope of the leaky relu activation function.
         """
         super().__init__()
         if len(kernel_sizes) != len(strides) or len(kernel_sizes) != len(number_of_channels):
@@ -105,14 +107,14 @@ class CNN(torch.nn.Module):
                     )
                 )
             layers.append(torch.nn.BatchNorm2d(n_channels))
-            layers.append(torch.nn.LeakyReLU())
+            layers.append(torch.nn.LeakyReLU(negative_slope=lrelu_neg_slope))
         layers.append(torch.nn.Flatten())
         num_input_neurons = number_of_channels[-1] * self._calculate_number_input_neurons_linear_layer(
             input_size[1:], strides
         )
         layers.append(torch.nn.Linear(num_input_neurons, neurons_linear_layer))
         layers.append(torch.nn.BatchNorm1d(neurons_linear_layer))
-        layers.append(torch.nn.LeakyReLU())
+        layers.append(torch.nn.LeakyReLU(negative_slope=lrelu_neg_slope))
         layers.append(torch.nn.Dropout(dropout_rate))
         layers.append(torch.nn.Linear(neurons_linear_layer, num_outputs))
         self.layers: Callable[[Any], torch.Tensor] = torch.nn.Sequential(*layers)
@@ -176,8 +178,10 @@ def main(cfg: DictConfig) -> None:
     loss_function = hydra.utils.get_class(cfg.loss_function.type)(reduction="none")
 
     # Train the model
-    out_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
     with mlflow.start_run():
+        run = mlflow.active_run()
+        run_id = run.info.run_id
+        out_dir = Path(hydra.core.hydra_config.HydraConfig.get().runtime.output_dir).joinpath(run_id)
         trainer = Trainer(
             model,
             optimizer,

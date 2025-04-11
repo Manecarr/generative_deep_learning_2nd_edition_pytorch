@@ -110,8 +110,10 @@ def main(cfg: DictConfig) -> None:
     loss_function = hydra.utils.get_class(cfg.loss_function.type)(reduction="none")
 
     # Train the model
-    out_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
     with mlflow.start_run():
+        run = mlflow.active_run()
+        run_id = run.info.run_id
+        out_dir = Path(hydra.core.hydra_config.HydraConfig.get().runtime.output_dir).joinpath(run_id)
         trainer = Trainer(
             model,
             optimizer,
