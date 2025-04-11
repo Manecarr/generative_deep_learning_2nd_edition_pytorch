@@ -1,8 +1,8 @@
 from pathlib import Path
 from typing import Any, Callable
 
-import torch.utils.data as data
 from _typeshed import Incomplete
+import torch.utils.data as data
 
 class VisionDataset(data.Dataset):
     root: Incomplete

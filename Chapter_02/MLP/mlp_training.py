@@ -1,13 +1,13 @@
-import logging
 from collections.abc import Callable, Sequence
 from functools import partial
+import logging
 from pathlib import Path
 from typing import Any
 
 import hydra
 import mlflow
-import torch
 from omegaconf import DictConfig
+import torch
 from torchvision.transforms import Compose, ToTensor
 
 from utils.data.datasets import DATA_CACHE_DIR, get_cifar10_dataset

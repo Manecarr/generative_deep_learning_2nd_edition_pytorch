@@ -1,11 +1,11 @@
-import logging
 from collections.abc import Callable
+import logging
 from pathlib import Path
 from typing import Any
 
 import mlflow
-import torch
 from omegaconf import DictConfig
+import torch
 from torch import Tensor
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
