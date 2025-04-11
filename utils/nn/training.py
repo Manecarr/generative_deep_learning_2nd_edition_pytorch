@@ -18,6 +18,40 @@ logger = logging.getLogger(__name__)
 MLFLOW_BACKEND_STORE_DIR = str(Path(__name__).parent.parent.joinpath(".mlruns").absolute())
 
 
+class LoggingCounterWithBackoff:
+    def __init__(self, start_iter: int, warmup_iters: int, backoff_factor: float = 2) -> None:
+        """Initialize the counter with backoff.
+
+        Metrics will always be calculated on a whole epoch, but only if the logging counter allows it.
+
+
+        Args:
+            current_iter: the current iteration
+            start_iter: logging will not start before this iterations.
+            warmup_iters: number of iterations to wait before starting logging. In practice, the first time
+                logging will happen after ``start_iter + warmup_iters`` iterations.
+            backoff_factor: the backoff factor: if logging happened at iteration ``n``, the next time it will
+                happen at iteration ``int(n * backoff_factor)``.
+        """
+        if not backoff_factor >= 1:
+            raise ValueError("Backoff factor must be greater than or equal to 1.")
+        self.log_iter = start_iter + warmup_iters
+        self.backoff_factor = backoff_factor
+        self.current_iter: int = 0
+
+    def can_log(self) -> bool:
+        """Check if we can log."""
+        return self.current_iter >= self.log_iter
+
+    def update_current_iteration(self, current_iteration: int) -> None:
+        """Update the current iteration."""
+        self.current_iter = current_iteration
+
+    def update_log_iter(self) -> None:
+        """Update the log iteration."""
+        self.log_iter = int(self.log_iter * self.backoff_factor)
+
+
 def setup_mlflow(tracking_uri: str = MLFLOW_BACKEND_STORE_DIR, experiment_name: str = "my_experiment") -> None:
     """Set up MLFlow for tracking the runs.
 
@@ -73,6 +107,10 @@ class Trainer:
         self.summary_writer: SummaryWriter
 
         self.run_cfg: dict[str, Any] = dict(run_cfg)
+        self.logging_counter = LoggingCounterWithBackoff(
+            start_iter=0,
+            warmup_iters=10000,
+        )
 
         self.run_id: str
         self.total_epochs: int = num_epochs
@@ -140,30 +178,31 @@ class Trainer:
 
             self.current_iteration += len(labels)
             iterations_in_epoch += len(labels)
+            self.logging_counter.update_current_iteration(self.current_iteration)
 
         self.current_epoch += 1
+        # Calculate and log only if the logging counter allows it. Except for the last epoch.
+        if self.logging_counter.can_log() or self.current_epoch == self.total_epochs:
+            metrics = self.calculate_metrics(
+                torch.cat(predictions),
+                torch.cat(correct_labels),
+            )
 
-        # Log
-        metrics = self.calculate_metrics(
-            torch.cat(predictions),
-            torch.cat(correct_labels),
-        )
+            train_loss = running_loss / iterations_in_epoch
+            logger.info(
+                "Epoch: %d, train loss (avg. over epoch): %.3f, train accuracy: %.2f.",
+                self.current_epoch,
+                train_loss,
+                metrics["accuracy"],
+            )
 
-        train_loss = running_loss / iterations_in_epoch
-        logger.info(
-            "Epoch: %d, train loss (avg. over epoch): %.3f, train accuracy: %.2f.",
-            self.current_epoch,
-            train_loss,
-            metrics["accuracy"],
-        )
-
-        # Store epoch metrics
-        self.metrics["Loss/Train"] = train_loss
-        self.metrics["Accuracy/Train"] = metrics["accuracy"]
-        self.metrics["TPs/Train"] = metrics["TPs"]
-        self.metrics["FPs/Train"] = metrics["FPs"]
-        self.metrics["TPs rel./Train"] = metrics["TPs (%)"]
-        self.metrics["FPs rel./Train"] = metrics["FPs (%)"]
+            # Store epoch metrics
+            self.metrics["Loss/Train"] = train_loss
+            self.metrics["Accuracy/Train"] = metrics["accuracy"]
+            self.metrics["TPs/Train"] = metrics["TPs"]
+            self.metrics["FPs/Train"] = metrics["FPs"]
+            self.metrics["TPs rel./Train"] = metrics["TPs (%)"]
+            self.metrics["FPs rel./Train"] = metrics["FPs (%)"]
 
     def validate_one_epoch(self) -> None:
         """Run validation on one epoch."""
@@ -188,38 +227,41 @@ class Trainer:
                 predictions.append(outputs.detach())
                 correct_labels.append(labels)
                 iterations_in_epoch += len(labels)
-        # Log
-        metrics = self.calculate_metrics(
-            torch.cat(predictions),
-            torch.cat(correct_labels),
-        )
-        val_loss = running_loss / iterations_in_epoch
-        logger.info(
-            "Epoch: %d, validation loss (avg. over epoch): %.3f, validation accuracy: %.2f.",
-            self.current_epoch,
-            val_loss,
-            metrics["accuracy"],
-        )
 
-        # Store epoch metrics
-        self.metrics["Loss/Validation"] = val_loss
-        self.metrics["Accuracy/Validation"] = metrics["accuracy"]
-        self.metrics["TPs/Validation"] = metrics["TPs"]
-        self.metrics["FPs/Validation"] = metrics["FPs"]
-        self.metrics["TPs rel./Validation"] = metrics["TPs (%)"]
-        self.metrics["FPs rel./Validation"] = metrics["FPs (%)"]
+        if self.logging_counter.can_log() or self.current_epoch == self.total_epochs:
+            # Log
+            metrics = self.calculate_metrics(
+                torch.cat(predictions),
+                torch.cat(correct_labels),
+            )
+            val_loss = running_loss / iterations_in_epoch
+            logger.info(
+                "Epoch: %d, validation loss (avg. over epoch): %.3f, validation accuracy: %.2f.",
+                self.current_epoch,
+                val_loss,
+                metrics["accuracy"],
+            )
+
+            # Store epoch metrics
+            self.metrics["Loss/Validation"] = val_loss
+            self.metrics["Accuracy/Validation"] = metrics["accuracy"]
+            self.metrics["TPs/Validation"] = metrics["TPs"]
+            self.metrics["FPs/Validation"] = metrics["FPs"]
+            self.metrics["TPs rel./Validation"] = metrics["TPs (%)"]
+            self.metrics["FPs rel./Validation"] = metrics["FPs (%)"]
 
     def fit(self) -> None:
         """Train the model."""
         for epoch_num in range(1, self.total_epochs + 1):
-            logger.info("Starting training for epoch: %d", self.current_epoch)
             self.train_one_epoch()
             if self.val_loader is not None:
                 self.validate_one_epoch()
-            self.log_metrics()
-            self.log_model_weights_histogram()
+            if self.logging_counter.can_log() or self.current_epoch == self.total_epochs:
+                self.log_metrics()
+                self.log_model_weights_histogram()
+                self.summary_writer.flush()
+                self.logging_counter.update_log_iter()
             self.metrics = {}
-            self.summary_writer.flush()
             # Log tensorboard artifacts in MLFlow
             mlflow.log_artifact(str(self.tensorboard_log_dir))
         logger.info("Training finished.")
