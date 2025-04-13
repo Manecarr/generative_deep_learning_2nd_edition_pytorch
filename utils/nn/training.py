@@ -59,7 +59,7 @@ def setup_mlflow(tracking_uri: str = MLFLOW_BACKEND_STORE_DIR, experiment_name: 
 
     Args:
         tracking_uri: the URL of the MLFlow tracking server.
-        experiment_name: the name of the experiment.
+        experiment_name: the name of the exp/nexteriment.
     """
     mlflow.set_tracking_uri(tracking_uri)
     mlflow.set_experiment(experiment_name)
@@ -122,7 +122,15 @@ class Trainer:
         self.metrics: dict[str, Any] = {}
         self.buffers: dict[str, Any] = {}
 
-        self.input_shape: tuple[int, ...] = next(iter(train_loader))[0].shape
+        self.input_example = next(iter(train_loader))[0].to(self.device, non_blocking=True)
+        self.input_shape: tuple[int, ...] = self.input_example.shape
+        self.model.eval()
+        with torch.inference_mode():
+            output_example = self.model(self.input_example)
+        self.input_signatures = mlflow.models.infer_signature(
+            self.input_example.cpu().numpy(), output_example.cpu().numpy()
+        )
+
         assert "model" in self.run_cfg, "Model is not in the run configuration."
         self.input_image_shape: tuple[int, ...] = tuple(self.run_cfg["model"].input_image_shape)
 
@@ -136,7 +144,7 @@ class Trainer:
         self.tensorboard_log_dir = tb_log_dir
         self.train_loader = train_loader
 
-        self._log_model()
+        self._log_model_summary()
 
     def log_model_weights_histogram(self) -> None:
         """Log the model weights histogram to Tensorboard."""
@@ -147,7 +155,7 @@ class Trainer:
                     name + "_grad", param.grad.detach().cpu().numpy().flatten(), self.current_iteration
                 )
 
-    def _log_model(self) -> None:
+    def _log_model_summary(self) -> None:
         """Log the model specifications to MLFlow."""
         mlflow.log_params(self.run_cfg)
         with self.output_dir.joinpath("model_summary.txt").open("w", encoding="utf-8") as f:
@@ -167,6 +175,31 @@ class Trainer:
 
         self.summary_writer.add_figure(tag, fig, self.current_iteration, close=True)
         mlflow.log_figure(fig, tag + f"/Iter_{self.current_iteration}.png")
+
+    def _log_model(self) -> None:
+        """Save the model checkpoint and register it on MLFlow."""
+        # We log the checkpoint saved_dict as artifact, in case one wants to continue training, and
+        # a model ready for inference as onnx
+        checkpoint_path = self.output_dir.joinpath(f"checkpoint_{self.current_iteration}.pth")
+        torch.save(
+            {
+                "model_state_dict": self.model.state_dict(),
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "epoch": self.current_epoch,
+                "iteration": self.current_iteration,
+            },
+            checkpoint_path,
+        )
+        mlflow.log_artifact(str(checkpoint_path), artifact_path="checkpoints")
+        # Convert model to onnx
+        onnx_program = torch.onnx.export(self.model, self.input_example, dynamo=True)
+        assert onnx_program is not None, "ONNX export failed."
+        onnx_program.optimize()
+        mlflow.onnx.log_model(
+            onnx_program.model_proto,
+            artifact_path=f"onnx_model/model_{self.current_iteration}.onnx",
+            signature=self.input_signatures,
+        )
 
     def train_one_epoch(self) -> None:
         """Train the model for one epoch."""
@@ -330,6 +363,7 @@ class Trainer:
             mlflow.log_artifact(str(self.tensorboard_log_dir))
         logger.info("Training finished.")
         self.summary_writer.close()
+        self._log_model()
 
     def calculate_metrics(self, predictions: Tensor, gts: Tensor) -> dict[str, float]:
         """Calculate the metrics.
