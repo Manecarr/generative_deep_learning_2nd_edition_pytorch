@@ -14,6 +14,7 @@ from torchvision.transforms import ToTensor
 from utils.data.datasets import DATA_CACHE_DIR, get_cifar10_dataset
 from utils.nn.initialization import initialize_model_weights
 from utils.nn.training import Trainer, setup_mlflow
+from utils.nn.utils import build_conv2d_layer
 
 logger = logging.getLogger(__name__)
 
@@ -83,29 +84,10 @@ class CNN(torch.nn.Module):
             raise ValueError("kernel_sizes, strides and number_of_channels must have the same length.")
         layers: list[torch.nn.Module] = []
         for i, (kernel_size, stride, n_channels) in enumerate(zip(kernel_sizes, strides, number_of_channels)):
-            if stride == 1:
-                layers.append(
-                    torch.nn.Conv2d(
-                        in_channels=input_size[0] if i == 0 else number_of_channels[i - 1],
-                        out_channels=n_channels,
-                        kernel_size=kernel_size,
-                        stride=stride,
-                        padding="same",
-                    )
-                )
-            else:
-                # for stride > 1, PyTorch does not support "same" padding: we need to calculate the padding.
-                pad_h = self._calculate_same_padding(input_size[1], kernel_size, stride)
-                pad_w = self._calculate_same_padding(input_size[2], kernel_size, stride)
-                layers.append(
-                    torch.nn.Conv2d(
-                        in_channels=input_size[0] if i == 0 else number_of_channels[i - 1],
-                        out_channels=n_channels,
-                        kernel_size=kernel_size,
-                        stride=stride,
-                        padding=(pad_h, pad_w),
-                    )
-                )
+            in_channels = input_size[0] if i == 0 else number_of_channels[i - 1]
+            layers.append(
+                build_conv2d_layer(input_size[1:], in_channels, n_channels, kernel_size, stride, padding="tf_same")
+            )
             layers.append(torch.nn.BatchNorm2d(n_channels))
             layers.append(torch.nn.LeakyReLU(negative_slope=lrelu_neg_slope))
         layers.append(torch.nn.Flatten())
@@ -130,10 +112,6 @@ class CNN(torch.nn.Module):
         h_f = input_size[0] / math.prod(strides)
         w_f = input_size[1] / math.prod(strides)
         return int(h_f * w_f)
-
-    def _calculate_same_padding(self, input_size: int, kernel_size: int, stride: int) -> int:
-        """It will calculate the padding so that the output of the given conv layer is same as its input."""
-        return max(0, (math.ceil((input_size / stride) - 1) * stride + (kernel_size - 1) - input_size + 1))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass of the model.
