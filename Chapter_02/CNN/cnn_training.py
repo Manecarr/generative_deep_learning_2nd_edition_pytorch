@@ -14,7 +14,7 @@ from torchvision.transforms import ToTensor
 from utils.data.datasets import DATA_CACHE_DIR, get_cifar10_dataset
 from utils.nn.initialization import initialize_model_weights
 from utils.nn.training import Trainer, setup_mlflow
-from utils.nn.utils import build_conv2d_layer
+from utils.nn.utils import build_conv2d_layer, calculate_output_shape_conv_layer
 
 logger = logging.getLogger(__name__)
 
@@ -83,17 +83,20 @@ class CNN(torch.nn.Module):
         if len(kernel_sizes) != len(strides) or len(kernel_sizes) != len(number_of_channels):
             raise ValueError("kernel_sizes, strides and number_of_channels must have the same length.")
         layers: list[torch.nn.Module] = []
+        new_input_size = input_size
         for i, (kernel_size, stride, n_channels) in enumerate(zip(kernel_sizes, strides, number_of_channels)):
-            in_channels = input_size[0] if i == 0 else number_of_channels[i - 1]
+            in_channels = new_input_size[0] if i == 0 else number_of_channels[i - 1]
             layers.append(
-                build_conv2d_layer(input_size[1:], in_channels, n_channels, kernel_size, stride, padding="tf_same")
+                build_conv2d_layer(new_input_size[1:], in_channels, n_channels, kernel_size, stride, padding="tf_same")
+            )
+            new_input_size = (
+                n_channels,
+                *calculate_output_shape_conv_layer(new_input_size[1:], kernel_size, stride, padding="tf_same"),
             )
             layers.append(torch.nn.BatchNorm2d(n_channels))
             layers.append(torch.nn.LeakyReLU(negative_slope=lrelu_neg_slope))
         layers.append(torch.nn.Flatten())
-        num_input_neurons = number_of_channels[-1] * self._calculate_number_input_neurons_linear_layer(
-            input_size[1:], strides
-        )
+        num_input_neurons = math.prod(new_input_size)
         layers.append(torch.nn.Linear(num_input_neurons, neurons_linear_layer))
         layers.append(torch.nn.BatchNorm1d(neurons_linear_layer))
         layers.append(torch.nn.LeakyReLU(negative_slope=lrelu_neg_slope))
@@ -101,17 +104,6 @@ class CNN(torch.nn.Module):
         layers.append(torch.nn.Linear(neurons_linear_layer, num_outputs))
         self.layers: Callable[[Any], torch.Tensor] = torch.nn.Sequential(*layers)
         self._layers = layers
-
-    def _calculate_number_input_neurons_linear_layer(self, input_size: tuple[int, int], strides: Sequence[int]) -> int:
-        """Calculates the number of input neurons for the linear layer.
-
-        This uses the fact that we use ``padding="same"`` in the conv layers and there are only
-        conv layers. So, if an input image of size (c, h, w) is passed to a conv layer with stride s,
-        then the output image will have size (c_out, h/s, w/s).
-        """
-        h_f = input_size[0] / math.prod(strides)
-        w_f = input_size[1] / math.prod(strides)
-        return int(h_f * w_f)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass of the model.
