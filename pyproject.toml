@@ -18,6 +18,7 @@ dependencies = [
     "onnx>=1.18.0rc1",
     "onnxscript>=0.2.4",
     "onnxruntime-gpu>=1.21.0",
+    "scipy>=1.15.2",
 ]
 
 [[tool.uv.index]]
