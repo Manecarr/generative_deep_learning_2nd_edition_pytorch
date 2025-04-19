@@ -41,6 +41,6 @@ optimizer:
   type: torch.optim.Adam
   lr: 0.0005
 loss_function:
-  type: torch.nn.BinaryCrossEntropyLoss
+  type: torch.nn.BCELoss
 training:
   num_epochs: 3

@@ -2,10 +2,11 @@ from collections.abc import Callable
 import logging
 import math
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import matplotlib.pyplot as plt
 import mlflow
+import numpy as np
 from omegaconf import DictConfig
 import torch
 from torch import Tensor
@@ -121,6 +122,7 @@ class Trainer:
 
         self.metrics: dict[str, Any] = {}
         self.buffers: dict[str, Any] = {}
+        self._initialize_buffers()
 
         self.input_example = next(iter(train_loader))[0].to(self.device, non_blocking=True)
         self.input_shape: tuple[int, ...] = self.input_example.shape
@@ -146,6 +148,14 @@ class Trainer:
 
         self._log_model_summary()
 
+    def _initialize_buffers(self) -> None:
+        """Initialize common buffers."""
+        # Buffers that are always kept in memory, epoch-wise
+        self.buffers["Losses/Train"] = []
+        self.buffers["Losses/Validation"] = []
+        self.buffers["Hardest_example/Train"] = None
+        self.buffers["Hardest_example/Validation"] = None
+
     def log_model_weights_histogram(self) -> None:
         """Log the model weights histogram to Tensorboard."""
         for name, param in self.model.named_parameters():
@@ -163,15 +173,38 @@ class Trainer:
         mlflow.log_artifact(str(self.output_dir.joinpath("model_summary.txt")))
         self.log_model_weights_histogram()
 
-    def _log_image(self, tag: str, image: Tensor, actual_class: str | int, pred_class: str | int, loss: float) -> None:
+    def _log_image(self, tag: str, image: Tensor, mode: Literal["train", "validation"]) -> None:
         """Log an image to Tensorboard and MLFlow."""
+        classes: list[str] | None = getattr(self.train_loader.dataset, "classes", None)
+        match mode:
+            case "train":
+                h_index = self.buffers["Index_hardest_example/Train"]
+                logits_hardest_example = self.buffers["Predictions/Train"][h_index]
+                label_hardest_example = self.buffers["Labels/Train"][h_index]
+                loss = self.buffers["Losses/Train"][h_index]
+            case "validation":
+                h_index = self.buffers["Index_hardest_example/Validation"]
+                logits_hardest_example = self.buffers["Predictions/Validation"][h_index]
+                label_hardest_example = self.buffers["Labels/Validation"][h_index]
+                loss = self.buffers["Losses/Validation"][h_index]
+            case _:
+                raise ValueError(f"Unknown mode: {mode}. Use 'train' or 'validation'.")
+        if classes is not None:
+            # If the dataset has a list of classes, use it to get the class names
+            predicted_hardest_class = classes[logits_hardest_example.argmax().item()]
+            actual_hardest_class = classes[label_hardest_example.item()]
+        else:
+            predicted_hardest_class = logits_hardest_example.argmax().item()
+            actual_hardest_class = label_hardest_example.item()
         image_array = image.cpu().numpy().transpose(1, 2, 0)
         # create image
         fig = plt.figure(figsize=(6, 6))
         ax = fig.add_subplot(1, 1, 1)
         ax.axis("off")
         ax.imshow(image_array)
-        ax.set_title(f"Actual class: {actual_class}, predicted class: {pred_class}, loss: {loss:.2f}")
+        ax.set_title(
+            f"Actual class: {actual_hardest_class}, predicted class: {predicted_hardest_class}, loss: {loss:.2f}"
+        )
 
         self.summary_writer.add_figure(tag, fig, self.current_iteration, close=True)
         mlflow.log_figure(fig, tag + f"/Iter_{self.current_iteration}.png")
@@ -201,74 +234,75 @@ class Trainer:
             signature=self.input_signatures,
         )
 
+    def train_one_batch(self, batch: tuple[Tensor, Tensor]) -> tuple[Tensor, Tensor, Tensor]:
+        """Train the model on one batch."""
+        self.optimizer.zero_grad()
+        inputs, labels = batch
+        inputs = inputs.to(self.device, non_blocking=True)
+        labels = labels.to(self.device, non_blocking=True)
+
+        outputs = self.model(inputs)
+        loss = self.loss_fn(outputs, labels)
+        loss_values = loss.detach()
+        # The loss must not have been reduced yet
+        assert loss_values.dim() == 1, f"Loss should be a vector, but got {loss.dim()} dimensions."
+
+        loss = loss.mean()
+        loss.backward()
+        self.optimizer.step()
+
+        self.current_iteration += len(labels)
+        self.buffers["Losses/Train"].append(loss_values)
+        self.logging_counter.update_current_iteration(self.current_iteration)
+
+        hardest_example_batch = inputs[loss_values.argmax()]
+
+        return (
+            outputs.detach(),
+            labels,
+            hardest_example_batch,
+        )
+
     def train_one_epoch(self) -> None:
         """Train the model for one epoch."""
         self.model.train()
 
-        classes: list[str] | None = getattr(self.train_loader.dataset, "classes", None)
-        running_loss = 0.0
         predictions: list[Tensor] = []
         correct_labels: list[Tensor] = []
-        iterations_in_epoch = 0
-        # Keep track of the example in the epoch yielding the highest loss
-        max_loss: float = -math.inf
-        hardest_example: Tensor
-        predicted_hardest_class: str | int
-        actual_hardest_class: str | int
-        for batch in self.train_loader:
-            self.optimizer.zero_grad()
-            inputs, labels = batch
-            inputs = inputs.to(self.device, non_blocking=True)
-            labels = labels.to(self.device, non_blocking=True)
-
-            outputs = self.model(inputs)
-            loss = self.loss_fn(outputs, labels)
-            # The loss must not have been reduced yet
-            assert loss.detach().dim() == 1, f"Loss should be a vector, but got {loss.dim()} dimensions."
-            running_loss += loss.detach().sum().item()
-            if (new_highest_loss := loss.detach().max().item()) > max_loss:
-                max_loss = new_highest_loss
-                h_index = loss.detach().argmax().item()
-                hardest_example = inputs[h_index]
-                if classes is not None:
-                    # If the dataset has a list of classes, use it to get the class names
-                    predicted_hardest_class = classes[outputs.detach()[h_index].argmax().item()]
-                    actual_hardest_class = classes[labels[h_index].item()]
-                else:
-                    predicted_hardest_class = outputs.detach()[h_index].argmax().item()
-                    actual_hardest_class = labels[h_index].item()
-
-            predictions.append(outputs.detach())
-            correct_labels.append(labels)
-
-            loss = loss.mean()
-            loss.backward()
-            self.optimizer.step()
-
-            self.current_iteration += len(labels)
-            iterations_in_epoch += len(labels)
-            self.logging_counter.update_current_iteration(self.current_iteration)
-
+        self.buffers["Predictions/Train"] = []
+        self.buffers["Labels/Train"] = []
+        max_loss = -math.inf
+        for batch_index, batch in enumerate(self.train_loader):
+            (batch_predictions, batch_correct_labels, hardest_example_batch) = self.train_one_batch(batch)
+            max_loss_batch = self.buffers["Losses/Train"][batch_index].max().item()
+            if max_loss_batch > max_loss:
+                max_loss = max_loss_batch
+                self.buffers["Hardest_example/Train"] = hardest_example_batch
+            predictions.append(batch_predictions)
+            correct_labels.append(batch_correct_labels)
+        self.buffers["Losses/Train"] = torch.cat(self.buffers["Losses/Train"])
+        self.buffers["Predictions/Train"] = torch.cat(predictions)
+        self.buffers["Labels/Train"] = torch.cat(correct_labels)
         self.current_epoch += 1
+        index_hardest_example = self.buffers["Losses/Train"].argmax().item()
+        self.buffers["Index_hardest_example/Train"] = index_hardest_example
+        self.update_train_metrics()
+
+    def update_train_metrics(self) -> None:
         # Calculate and log only if the logging counter allows it. Except for the last epoch.
         if self.logging_counter.can_log() or self.current_epoch == self.total_epochs:
             metrics = self.calculate_metrics(
-                torch.cat(predictions),
-                torch.cat(correct_labels),
+                self.buffers["Predictions/Train"],
+                self.buffers["Labels/Train"],
             )
 
-            train_loss = running_loss / iterations_in_epoch
+            train_loss = self.buffers["Losses/Train"].mean().item()
             logger.info(
                 "Epoch: %d, train loss (avg. over epoch): %.3f, train accuracy: %.2f.",
                 self.current_epoch,
                 train_loss,
                 metrics["accuracy"],
             )
-
-            self.buffers["Hardest_example/Train"] = hardest_example
-            self.buffers["Highest_loss/Train"] = max_loss
-            self.buffers["Predicted_hardest_class/Train"] = predicted_hardest_class
-            self.buffers["Actual_hardest_class/Train"] = actual_hardest_class
 
             # Store epoch metrics
             self.metrics["Loss/Train"] = train_loss
@@ -278,69 +312,65 @@ class Trainer:
             self.metrics["TPs rel./Train"] = metrics["TPs (%)"]
             self.metrics["FPs rel./Train"] = metrics["FPs (%)"]
 
+    def validate_one_batch(self, batch: tuple[Tensor, Tensor]) -> tuple[Tensor, Tensor, Tensor]:
+        """Train the model on one batch."""
+        inputs, labels = batch
+        inputs = inputs.to(self.device, non_blocking=True)
+        labels = labels.to(self.device, non_blocking=True)
+
+        outputs = self.model(inputs)
+        loss = self.loss_fn(outputs, labels)
+        # The loss must not have been reduced yet
+        assert loss.dim() == 1, f"Loss should be a vector, but got {loss.dim()} dimensions."
+        self.buffers["Losses/Validation"].append(loss)
+
+        hardest_example_batch = inputs[loss.argmax()]
+        return (outputs, labels, hardest_example_batch)
+
     def validate_one_epoch(self) -> None:
         """Run validation on one epoch."""
         assert self.val_loader is not None, "Validation loader is not set. Cannot validate."
         self.model.eval()
 
-        classes: list[str] | None = getattr(self.train_loader.dataset, "classes", None)
-
+        self.buffers["Predictions/Validation"] = None
+        self.buffers["Labels/Validation"] = None
+        max_loss = -math.inf
         with torch.inference_mode():
-            running_loss = 0.0
-            iterations_in_epoch = 0
             predictions: list[Tensor] = []
             correct_labels: list[Tensor] = []
-            # Keep track of the example in the epoch yielding the highest loss
-            max_loss: float = -math.inf
-            hardest_example: Tensor
-            predicted_hardest_class: int
-            actual_hardest_class: int
-            for batch in self.val_loader:
-                inputs, labels = batch
-                inputs = inputs.to(self.device, non_blocking=True)
-                labels = labels.to(self.device, non_blocking=True)
+            for batch_index, batch in enumerate(self.val_loader):
+                (batch_predictions, batch_labels, hardest_example_batch) = self.validate_one_batch(batch)
+                max_loss_batch = self.buffers["Losses/Validation"][batch_index].max().item()
+                if max_loss_batch > max_loss:
+                    max_loss = max_loss_batch
+                    self.buffers["Hardest_example/Validation"] = hardest_example_batch
+                predictions.append(batch_predictions)
+                correct_labels.append(batch_labels)
+            self.buffers["Losses/Validation"] = torch.cat(self.buffers["Losses/Validation"])
+            self.buffers["Predictions/Validation"] = torch.cat(predictions)
+            self.buffers["Labels/Validation"] = torch.cat(correct_labels)
+            index_hardest_example = self.buffers["Losses/Validation"].argmax().item()
+            self.buffers["Index_hardest_example/Validation"] = index_hardest_example
+            self.update_validation_metrics()
 
-                outputs = self.model(inputs)
-                loss = self.loss_fn(outputs, labels)
-                # The loss must not have been reduced yet
-                assert loss.dim() == 1, f"Loss should be a vector, but got {loss.dim()} dimensions."
-                if (new_highest_loss := loss.max().item()) > max_loss:
-                    max_loss = new_highest_loss
-                    h_index = loss.argmax().item()
-                    hardest_example = inputs[h_index]
-                    if classes is not None:
-                        # If the dataset has a list of classes, use it to get the class names
-                        predicted_hardest_class = classes[outputs[h_index].argmax().item()]
-                        actual_hardest_class = classes[labels[h_index].item()]
-                    else:
-                        predicted_hardest_class = outputs[h_index].argmax().item()
-                        actual_hardest_class = labels[h_index].item()
-                running_loss += loss.sum().item()
-                predictions.append(outputs.detach())
-                correct_labels.append(labels)
-                iterations_in_epoch += len(labels)
-
+    def update_validation_metrics(self) -> None:
+        # Calculate and log only if the logging counter allows it. Except for the last epoch.
         if self.logging_counter.can_log() or self.current_epoch == self.total_epochs:
             # Log
             metrics = self.calculate_metrics(
-                torch.cat(predictions),
-                torch.cat(correct_labels),
+                self.buffers["Predictions/Validation"],
+                self.buffers["Labels/Validation"],
             )
-            val_loss = running_loss / iterations_in_epoch
+            validation_loss = self.buffers["Losses/Validation"].mean().item()
             logger.info(
                 "Epoch: %d, validation loss (avg. over epoch): %.3f, validation accuracy: %.2f.",
                 self.current_epoch,
-                val_loss,
+                validation_loss,
                 metrics["accuracy"],
             )
 
-            self.buffers["Hardest_example/Validation"] = hardest_example
-            self.buffers["Highest_loss/Validation"] = max_loss
-            self.buffers["Predicted_hardest_class/Validation"] = predicted_hardest_class
-            self.buffers["Actual_hardest_class/Validation"] = actual_hardest_class
-
             # Store epoch metrics
-            self.metrics["Loss/Validation"] = val_loss
+            self.metrics["Loss/Validation"] = validation_loss
             self.metrics["Accuracy/Validation"] = metrics["accuracy"]
             self.metrics["TPs/Validation"] = metrics["TPs"]
             self.metrics["FPs/Validation"] = metrics["FPs"]
@@ -359,6 +389,8 @@ class Trainer:
                 self.summary_writer.flush()
                 self.logging_counter.update_log_iter()
             self.metrics = {}
+            self.buffers = {}
+            self._initialize_buffers()
             # Log tensorboard artifacts in MLFlow
             mlflow.log_artifact(str(self.tensorboard_log_dir))
         logger.info("Training finished.")
@@ -410,19 +442,122 @@ class Trainer:
         if hardest_train is not None:
             hardest_train = hardest_train.reshape(self.input_image_shape)
             # Log the image
-            self._log_image(
-                "Hardest_example/Train",
-                hardest_train,
-                self.buffers["Actual_hardest_class/Train"],
-                self.buffers["Predicted_hardest_class/Train"],
-                self.buffers["Highest_loss/Train"],
-            )
+            self._log_image("Hardest_example/Train", hardest_train, "train")
         if hardest_val is not None:
             hardest_val = hardest_val.reshape(self.input_image_shape)
-            self._log_image(
-                "Hardest_example/Validation",
-                hardest_val,
-                self.buffers["Actual_hardest_class/Validation"],
-                self.buffers["Predicted_hardest_class/Validation"],
-                self.buffers["Highest_loss/Validation"],
+            self._log_image("Hardest_example/Validation", hardest_val, "validation")
+
+
+class AETrainer(Trainer):
+    """Trainer class for an autoencoder."""
+
+    def _log_image(self, tag: str, image: Tensor, mode: Literal["train", "validation"]) -> None:
+        """Log an image to Tensorboard and MLFlow."""
+        classes: list[str] | None = getattr(self.train_loader.dataset, "classes", None)
+        match mode:
+            case "train":
+                h_index = self.buffers["Index_hardest_example/Train"]
+                label_hardest_example = self.buffers["Labels/Train"][h_index]
+                loss = self.buffers["Losses/Train"][h_index]
+                reconstructed_image = self.buffers["Predictions/Train"][h_index]
+            case "validation":
+                h_index = self.buffers["Index_hardest_example/Validation"]
+                label_hardest_example = self.buffers["Labels/Validation"][h_index]
+                loss = self.buffers["Losses/Validation"][h_index]
+                reconstructed_image = self.buffers["Predictions/Validation"][h_index]
+            case _:
+                raise ValueError(f"Unknown mode: {mode}. Use 'train' or 'validation'.")
+        if classes is not None:
+            # If the dataset has a list of classes, use it to get the class names
+            actual_hardest_class = classes[label_hardest_example.item()]
+        else:
+            actual_hardest_class = label_hardest_example.item()
+
+        original_image_array = image.cpu().numpy().transpose(1, 2, 0)
+        reconstructed_image_array = reconstructed_image.cpu().numpy().transpose(1, 2, 0)
+        l1_dist = np.abs(original_image_array - reconstructed_image_array).mean()
+        # create image
+        fig = plt.figure(figsize=(12, 6))
+        ax = fig.add_subplot(1, 2, 1)
+        ax2 = fig.add_subplot(1, 2, 2)
+        ax.axis("off")
+        ax2.axis("off")
+        ax.imshow(reconstructed_image_array)
+        ax2.imshow(original_image_array)
+        ax.set_title(f"Loss: {loss:.2f}, l1 distance: {l1_dist:.2f}, class: {actual_hardest_class}.")
+
+        self.summary_writer.add_figure(tag, fig, self.current_iteration, close=True)
+        mlflow.log_figure(fig, tag + f"/Iter_{self.current_iteration}.png")
+        self.summary_writer.add_figure(tag, fig, self.current_iteration, close=True)
+        mlflow.log_figure(fig, tag + f"/Iter_{self.current_iteration}.png")
+
+    def update_train_metrics(self) -> None:
+        # Calculate and log only if the logging counter allows it. Except for the last epoch.
+        if self.logging_counter.can_log() or self.current_epoch == self.total_epochs:
+            train_loss = self.buffers["Losses/Train"].mean().item()
+            logger.info(
+                "Epoch: %d, train loss (avg. over epoch): %.3f.",
+                self.current_epoch,
+                train_loss,
             )
+
+            # Store epoch metrics
+            self.metrics["Loss/Train"] = train_loss
+
+    def update_validation_metrics(self) -> None:
+        # Calculate and log only if the logging counter allows it. Except for the last epoch.
+        if self.logging_counter.can_log() or self.current_epoch == self.total_epochs:
+            # Log
+            validation_loss = self.buffers["Losses/Validation"].mean().item()
+            logger.info(
+                "Epoch: %d, validation loss (avg. over epoch): %.3f.",
+                self.current_epoch,
+                validation_loss,
+            )
+
+            # Store epoch metrics
+            self.metrics["Loss/Validation"] = validation_loss
+
+    def train_one_batch(self, batch: tuple[Tensor, Tensor]) -> tuple[Tensor, Tensor, Tensor]:
+        """Train the model on one batch."""
+        self.optimizer.zero_grad()
+        inputs, labels = batch
+        inputs = inputs.to(self.device, non_blocking=True)
+        labels = labels.to(self.device, non_blocking=True)
+
+        outputs = self.model(inputs)
+        loss = self.loss_fn(outputs, inputs)
+        loss_values = loss.detach().mean(axis=(1, 2, 3))
+        # The loss must not have been reduced yet
+        assert loss_values.dim() == 1, f"Loss should be a vector, but got {loss.dim()} dimensions."
+
+        loss = loss.mean()
+        loss.backward()
+        self.optimizer.step()
+
+        self.current_iteration += len(labels)
+        self.buffers["Losses/Train"].append(loss_values)
+        self.logging_counter.update_current_iteration(self.current_iteration)
+
+        hardest_example_batch = inputs[loss_values.argmax()]
+
+        return (
+            outputs.detach(),
+            labels,
+            hardest_example_batch,
+        )
+
+    def validate_one_batch(self, batch: tuple[Tensor, Tensor]) -> tuple[Tensor, Tensor, Tensor]:
+        """Train the model on one batch."""
+        inputs, labels = batch
+        inputs = inputs.to(self.device, non_blocking=True)
+        labels = labels.to(self.device, non_blocking=True)
+
+        outputs = self.model(inputs)
+        loss = self.loss_fn(outputs, inputs).mean(axis=(1, 2, 3))
+        # The loss must not have been reduced yet
+        assert loss.dim() == 1, f"Loss should be a vector, but got {loss.dim()} dimensions."
+        self.buffers["Losses/Validation"].append(loss)
+
+        hardest_example_batch = inputs[loss.argmax()]
+        return (outputs, labels, hardest_example_batch)
