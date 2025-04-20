@@ -128,9 +128,10 @@ class Trainer:
         self.input_shape: tuple[int, ...] = self.input_example.shape
         self.model.eval()
         with torch.inference_mode():
-            output_example = self.model(self.input_example)
+            mean, log_var, output_example = self.model(self.input_example)
+
         self.input_signatures = mlflow.models.infer_signature(
-            self.input_example.cpu().numpy(), output_example.cpu().numpy()
+            self.input_example.cpu().numpy(), (mean.cpu().numpy(), log_var.cpu().numpy(), output_example.cpu().numpy())
         )
 
         assert "model" in self.run_cfg, "Model is not in the run configuration."
@@ -561,3 +562,114 @@ class AETrainer(Trainer):
 
         hardest_example_batch = inputs[loss.argmax()]
         return (outputs, labels, hardest_example_batch)
+
+
+class VAETrainer(AETrainer):
+    """Trainer for a variational autoencoder."""
+
+    def _initialize_buffers(self) -> None:
+        """Initialize common buffers."""
+        super()._initialize_buffers()
+        self.buffers["Reconstruction_Losses/Train"] = []
+        self.buffers["Reconstruction_Losses/Validation"] = []
+        self.buffers["KL_Losses/Train"] = []
+        self.buffers["KL_Losses/Validation"] = []
+
+    def _log_image(self, tag: str, image: Tensor, mode: Literal["train", "validation"]) -> None:
+        """Log an image to Tensorboard and MLFlow."""
+        super()._log_image(tag, image, mode)
+        # log a sampled output
+        with torch.inference_mode():
+            embeddings_dim = self.model.config["model"]["embeddings_dim"]
+            z = torch.randn((2, embeddings_dim), device=self.device)
+            generated_images = self.model.decoder(z).cpu().numpy().transpose((0, 2, 3, 1))
+        fig = plt.figure(figsize=(12, 6))
+        ax = fig.add_subplot(1, 2, 1)
+        ax2 = fig.add_subplot(1, 2, 2)
+        ax.axis("off")
+        ax2.axis("off")
+        ax.imshow(generated_images[0])
+        ax2.imshow(generated_images[1])
+
+        tag = "Generated_examples/" + mode
+        self.summary_writer.add_figure(tag, fig, self.current_iteration, close=True)
+        mlflow.log_figure(fig, tag + f"/Iter_{self.current_iteration}.png")
+        self.summary_writer.add_figure(tag, fig, self.current_iteration, close=True)
+        mlflow.log_figure(fig, tag + f"/Iter_{self.current_iteration}.png")
+
+    def train_one_batch(self, batch: tuple[Tensor, Tensor]) -> tuple[Tensor, Tensor, Tensor]:
+        """Train the model on one batch."""
+        self.optimizer.zero_grad()
+        inputs, labels = batch
+        inputs = inputs.to(self.device, non_blocking=True)
+        labels = labels.to(self.device, non_blocking=True)
+
+        mean, log_var, outputs = self.model(inputs)
+        rec_loss, kl_loss, loss = self.loss_fn(outputs, inputs, mean, log_var)
+        rec_loss = rec_loss.detach()
+        loss_values = loss.detach()
+        # The loss must not have been reduced yet
+        assert loss_values.dim() == 1, f"Loss should be a vector, but got {loss.dim()} dimensions."
+
+        loss = loss.mean()
+        loss.backward()
+        self.optimizer.step()
+
+        self.current_iteration += len(labels)
+        self.buffers["Losses/Train"].append(loss_values)
+        self.buffers["Reconstruction_Losses/Train"].append(rec_loss.detach())
+        self.buffers["KL_Losses/Train"].append(kl_loss.detach())
+        self.logging_counter.update_current_iteration(self.current_iteration)
+
+        hardest_example_batch = inputs[loss_values.argmax()]
+
+        return (
+            outputs.detach(),
+            labels,
+            hardest_example_batch,
+        )
+
+    def validate_one_batch(self, batch: tuple[Tensor, Tensor]) -> tuple[Tensor, Tensor, Tensor]:
+        """Train the model on one batch."""
+        inputs, labels = batch
+        inputs = inputs.to(self.device, non_blocking=True)
+        labels = labels.to(self.device, non_blocking=True)
+
+        mean, log_var, outputs = self.model(inputs)
+        rec_loss, kl_loss, loss = self.loss_fn(outputs, inputs, mean, log_var)
+        # The loss must not have been reduced yet
+        assert loss.dim() == 1, f"Loss should be a vector, but got {loss.dim()} dimensions."
+        self.buffers["Losses/Validation"].append(loss)
+        self.buffers["Reconstruction_Losses/Validation"].append(rec_loss)
+        self.buffers["KL_Losses/Validation"].append(kl_loss)
+
+        hardest_example_batch = inputs[loss.argmax()]
+        return (outputs, labels, hardest_example_batch)
+
+    def update_train_metrics(self) -> None:
+        # Calculate and log only if the logging counter allows it. Except for the last epoch.
+        super().update_train_metrics()
+        self.buffers["Reconstruction_Losses/Train"] = torch.cat(self.buffers["Reconstruction_Losses/Train"])
+        self.buffers["KL_Losses/Train"] = torch.cat(self.buffers["KL_Losses/Train"])
+        if self.logging_counter.can_log() or self.current_epoch == self.total_epochs:
+            rec_loss = self.buffers["Reconstruction_Losses/Train"].mean().item()
+            kl_loss = self.buffers["KL_Losses/Train"].mean().item()
+            logger.info("Epoch: %d, rec loss: %.3f, kl loss: %.3f.", self.current_epoch, rec_loss, kl_loss)
+
+            # Store epoch metrics
+            self.metrics["Reconstruction_Loss/Train"] = rec_loss
+            self.metrics["KL_Loss/Train"] = kl_loss
+
+    def update_validation_metrics(self) -> None:
+        # Calculate and log only if the logging counter allows it. Except for the last epoch.
+        super().update_validation_metrics()
+        self.buffers["Reconstruction_Losses/Validation"] = torch.cat(self.buffers["Reconstruction_Losses/Validation"])
+        self.buffers["KL_Losses/Validation"] = torch.cat(self.buffers["KL_Losses/Validation"])
+        if self.logging_counter.can_log() or self.current_epoch == self.total_epochs:
+            rec_loss = self.buffers["Reconstruction_Losses/Validation"].mean().item()
+            kl_loss = self.buffers["KL_Losses/Validation"].mean().item()
+            logger.info("Epoch: %d, rec loss: %.3f, kl loss: %.3f.", self.current_epoch, rec_loss, kl_loss)
+
+            # Store epoch metrics
+            self.metrics["Reconstruction_Loss/Validation"] = rec_loss
+            self.metrics["KL_Loss/Validation"] = kl_loss
