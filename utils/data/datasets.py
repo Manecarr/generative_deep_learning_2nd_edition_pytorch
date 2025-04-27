@@ -5,7 +5,7 @@ import csv
 from functools import partial
 import logging
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 import zipfile
 
 from diskcache import Cache
@@ -217,6 +217,8 @@ class CelebADataset(torch.utils.data.Dataset):
         img_names: list[str] = []
         with self.split_file_path.open("r", encoding="utf-8") as f:
             reader = csv.reader(f)
+            # skip header
+            next(reader)
             for row in reader:
                 if int(row[1]) == split_index:
                     img_names.append(row[0])
@@ -226,11 +228,11 @@ class CelebADataset(torch.utils.data.Dataset):
         """Return the number of images in the split."""
         return len(self.images_paths)
 
-    def __get_item__(self, index: int) -> torch.Tensor:
+    def __getitem__(self, index: int) -> tuple[Any, int]:
         """Return a given image."""
         image_path = self.images_paths[index]
         image = Image.open(image_path)
-        image_tensor = torchvision.transforms.v2.ToImage()(image)
         if self.transform:
-            image_tensor = self.transform(image_tensor)
-        return image_tensor
+            image = self.transform(image)
+        image_id = int(image_path.stem)
+        return image, image_id

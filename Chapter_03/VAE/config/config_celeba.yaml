@@ -1,0 +1,55 @@
+hydra:
+  run:
+    dir: ./outputs/Chapter_03/VAE_faces/${now:%Y-%m-%d}/${now:%H-%M-%S}
+data:
+  pin_memory: True
+  num_workers: 8
+  batch_size: 128
+  shuffle: True
+model:
+  input_image_shape: [3, 32, 32]
+  input_size:
+    - 3
+    - 32
+    - 32
+  encoder_number_of_channels:
+    - 128
+    - 128
+    - 128
+    - 128
+  encoder_kernel_sizes:
+    - 3
+    - 3
+    - 3
+    - 3
+  encoder_strides:
+    - 2
+    - 2
+    - 2
+    - 2
+  decoder_number_of_channels:
+    - 128
+    - 128
+    - 128
+    - 128
+  decoder_kernel_sizes:
+    - 3
+    - 3
+    - 3
+    - 3
+  decoder_strides:  # strides for the transposed convolutions
+    - 2
+    - 2
+    - 2
+    - 2
+  embeddings_dim: 200
+optimizer:
+  type: torch.optim.Adam
+  lr: 0.0005
+loss_function:
+  type: utils.nn.modules.VAELoss
+  weights:
+    - 2000.0
+    - 1.0
+training:
+  num_epochs: 20
