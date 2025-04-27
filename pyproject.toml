@@ -19,6 +19,7 @@ dependencies = [
     "onnxscript>=0.2.4",
     "onnxruntime-gpu>=1.21.0",
     "scipy>=1.15.2",
+    "diskcache>=5.6.3",
 ]
 
 [[tool.uv.index]]
@@ -43,6 +44,9 @@ onnx = [
 ]
 
 [dependency-groups]
+datasets = [
+    "kaggle>=1.7.4.2",
+]
 dev = [
     "mlflow>=2.21.3",
     "mypy>=1.15.0",

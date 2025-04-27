@@ -1,6 +1,6 @@
 hydra:
   run:
-    dir: ./outputs/Chapter_03/AE/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    dir: ./outputs/Chapter_03/VAE/${now:%Y-%m-%d}/${now:%H-%M-%S}
 data:
   pin_memory: True
   num_workers: 8
