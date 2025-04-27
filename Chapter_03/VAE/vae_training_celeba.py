@@ -29,15 +29,8 @@ EXPERIMENT_NAME = "Chapter_03/VAE_celeba"
 setup_mlflow(experiment_name=EXPERIMENT_NAME)
 
 
-# using bilinear interpolation for resizing leads to errors in the calculation of the BCE loss.
-# Maybe related: https://discuss.pytorch.org/t/assertion-input-val-zero-input-val-one-failed/107554
-vae_data_transforms = Compose([ToImage(), ToDtype(torch.float32, scale=True), Resize((32, 32), interpolation=0)])
-
-download_datasets = partial(get_celeb_a_dataset, split="both", save_path=DATA_CACHE_DIR, transform=vae_data_transforms)
-
-
 def get_dataloaders(
-    batch_size: int, pin_memory: bool, num_workers: int | None, shuffle: bool
+    batch_size: int, pin_memory: bool, num_workers: int | None, shuffle: bool, resize_size: tuple[int, int]
 ) -> tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
     """Return the dataloaders for the training and validation sets.
 
@@ -46,10 +39,19 @@ def get_dataloaders(
         pin_memory: if True, the data will be pinned to memory.
         num_workers: the number of workers to use for loading the data.
         shuffle: if True, the training data will be shuffled.
+        resize_size: the size to resize the images to.
 
     Returns:
         the dataloaders for the training and validation sets.
     """
+    # using bilinear interpolation for resizing leads to errors in the calculation of the BCE loss.
+    # Maybe related: https://discuss.pytorch.org/t/assertion-input-val-zero-input-val-one-failed/107554
+    vae_data_transforms = Compose([ToImage(), ToDtype(torch.float32, scale=True), Resize(resize_size, interpolation=0)])
+
+    download_datasets = partial(
+        get_celeb_a_dataset, split="both", save_path=DATA_CACHE_DIR, transform=vae_data_transforms
+    )
+
     train_set, val_set = download_datasets()
     train_loader = torch.utils.data.DataLoader(
         train_set,
@@ -163,9 +165,7 @@ class VariationalAutoEncoder(torch.nn.Module):
         ):
             in_channels = new_input_size[0] if i == 0 else decoder_number_of_channels[i - 1]
             layers.append(
-                build_transpose_conv2d_layer(
-                    new_input_size[1:], in_channels, n_channels, kernel_size, stride, "tf_same", out_padding=None
-                )
+                build_transpose_conv2d_layer(in_channels, n_channels, kernel_size, stride, "tf_same", out_padding=None)
             )
             new_input_size = (
                 n_channels,
@@ -202,7 +202,7 @@ def main(cfg: DictConfig) -> None:
     # Prepare data loaders
     data_cfg = cfg.data
     train_loader, val_loader = get_dataloaders(
-        data_cfg.batch_size, data_cfg.pin_memory, data_cfg.num_workers, data_cfg.shuffle
+        data_cfg.batch_size, data_cfg.pin_memory, data_cfg.num_workers, data_cfg.shuffle, cfg.model.input_size[1:]
     )
     # Prepare the model
     model = VariationalAutoEncoder(

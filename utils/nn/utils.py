@@ -204,7 +204,7 @@ def calculate_output_shape_conv_layers(
 def calculate_transpose_conv_tf_same_padding(kernel_size: int, stride: int) -> tuple[int, int]:
     """It will calculate the padding in the same way that ``padding="same"`` does in TensorFlow for transpose conv.
 
-    Basically, when stride is `s` along one dimension, the padding is so that theat the output of the transpose
+    Basically, when stride is `s` along one dimension, the padding is so that the output of the transpose
     convolution has `sn` elements along that dimension, where `n` is the input size along that dimension.
 
     Given the formula given by Pytorch for the output of transpose convolutions, we need to solve the problem:
@@ -326,7 +326,6 @@ def calculate_output_shape_transpose_conv_layer(
 
 
 def build_transpose_conv2d_layer(
-    input_size: tuple[int, int],
     in_channels: int,
     out_channels: int,
     kernel_size: int | tuple[int, int],
@@ -337,7 +336,6 @@ def build_transpose_conv2d_layer(
     """Build a ConvTranspose2d layer with the given parameters.
 
     Args:
-        input_size: the spatial resolution of the input of the layer.
         in_channels: the number of input channels.
         out_channels: the number of output channels.
         kernel_size: the kernel size.
@@ -363,16 +361,16 @@ def build_transpose_conv2d_layer(
             stride_w = stride
         padding_h, out_padding_h = calculate_transpose_conv_tf_same_padding(kernel_size_h, stride_h)
         padding_w, out_padding_w = calculate_transpose_conv_tf_same_padding(kernel_size_w, stride_w)
-        padding = (padding_h, padding_w)
+        in_padding = (padding_h, padding_w)
         out_padding = (out_padding_h, out_padding_w)
     elif isinstance(padding, int):
-        padding = (padding, padding)
+        in_padding = (padding, padding)
     elif isinstance(padding, tuple) and len(padding) == 1:
-        padding = (padding[0], padding[0])
+        in_padding = (padding[0], padding[0])
     if isinstance(out_padding, int):
         out_padding = (out_padding, out_padding)
     elif isinstance(out_padding, tuple) and len(out_padding) == 1:
         out_padding = (out_padding[0], out_padding[0])
     return torch.nn.ConvTranspose2d(
-        in_channels, out_channels, kernel_size, stride=stride, padding=padding, output_padding=out_padding
+        in_channels, out_channels, kernel_size, stride=stride, padding=in_padding, output_padding=out_padding
     )

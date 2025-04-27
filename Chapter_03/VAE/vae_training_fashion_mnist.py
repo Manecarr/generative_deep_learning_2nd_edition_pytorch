@@ -152,9 +152,7 @@ class VariationalAutoEncoder(torch.nn.Module):
         ):
             in_channels = new_input_size[0] if i == 0 else decoder_number_of_channels[i - 1]
             layers.append(
-                build_transpose_conv2d_layer(
-                    new_input_size[1:], in_channels, n_channels, kernel_size, stride, "tf_same", out_padding=None
-                )
+                build_transpose_conv2d_layer(in_channels, n_channels, kernel_size, stride, "tf_same", out_padding=None)
             )
             new_input_size = (
                 n_channels,
