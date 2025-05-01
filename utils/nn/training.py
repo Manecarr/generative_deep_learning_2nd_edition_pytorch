@@ -1,4 +1,6 @@
 from collections.abc import Callable
+from dataclasses import dataclass
+from enum import StrEnum
 import logging
 import math
 from pathlib import Path
@@ -19,6 +21,21 @@ from utils.metrics.metrics import calculate_accuracy, calculate_tp_fp_tn_fn
 logger = logging.getLogger(__name__)
 
 MLFLOW_BACKEND_STORE_DIR = str(Path(__name__).parent.parent.joinpath(".mlruns").absolute())
+
+
+class Buffers(StrEnum):
+    """Define possible keys for buffers dictionary."""
+
+    TRAIN_LOSSES = "Losses/Train"
+    TRAIN_PREDICTIONS = "Predictions/Train"
+    TRAIN_GTS = "Labels/Train"
+    TRAIN_RECONSTRUCTION_LOSSES = "Reconstruction_Losses/Train"
+    TRAIN_KL_LOSSES = "KL_Losses/Train"
+    VAL_LOSSES = "Losses/Validation"
+    VAL_PREDICTIONS = "Predictions/Validation"
+    VAL_GTS = "Labels/Validation"
+    VAL_RECONSTRUCTION_LOSSES = "Reconstruction_Losses/Validation"
+    VAL_KL_LOSSES = "KL_Losses/Validation"
 
 
 class LoggingCounterWithBackoff:
@@ -64,6 +81,16 @@ def setup_mlflow(tracking_uri: str = MLFLOW_BACKEND_STORE_DIR, experiment_name: 
     """
     mlflow.set_tracking_uri(tracking_uri)
     mlflow.set_experiment(experiment_name)
+
+
+@dataclass
+class BatchExample:
+    """Keep track of a relevant example in a batch."""
+
+    loss_value: float
+    class_id: int | None = None
+    model_output: Tensor | None = None
+    data: Tensor | None = None
 
 
 class Trainer:
@@ -124,18 +151,18 @@ class Trainer:
         self.buffers: dict[str, Any] = {}
         self._initialize_buffers()
 
-        self.input_example = next(iter(train_loader))[0].to(self.device, non_blocking=True)
-        self.input_shape: tuple[int, ...] = self.input_example.shape
-        self.model.eval()
-        with torch.inference_mode():
-            mean, log_var, output_example = self.model(self.input_example)
-
-        self.input_signatures = mlflow.models.infer_signature(
-            self.input_example.cpu().numpy(), (mean.cpu().numpy(), log_var.cpu().numpy(), output_example.cpu().numpy())
-        )
+        # Hardest and easiest examples in an epoch
+        self.train_epoch_hardest_example: BatchExample = BatchExample(loss_value=-math.inf)
+        self.train_epoch_easiest_example: BatchExample = BatchExample(loss_value=math.inf)
+        self.validation_epoch_hardest_example: BatchExample = BatchExample(loss_value=-math.inf)
+        self.validation_epoch_easiest_example: BatchExample = BatchExample(loss_value=math.inf)
 
         assert "model" in self.run_cfg, "Model is not in the run configuration."
         self.input_image_shape: tuple[int, ...] = tuple(self.run_cfg["model"].input_image_shape)
+        self.input_shape: tuple[int, ...]
+        self.input_example: Tensor
+        self.input_signatures: mlflow.models.ModelSignature
+        self._initialize_model_signature()
 
         # Set up experiments details
         tb_log_dir = output_dir.joinpath("tensorboard")
@@ -145,17 +172,26 @@ class Trainer:
             raise FileExistsError(f"Tensorboard log directory {tb_log_dir} already exists.")
         self.summary_writer = SummaryWriter(log_dir=tb_log_dir)
         self.tensorboard_log_dir = tb_log_dir
-        self.train_loader = train_loader
 
         self._log_model_summary()
+
+    def _initialize_model_signature(self) -> None:
+        """Define the mlflow model signature."""
+        self.input_example = next(iter(self.train_loader))[0].to(self.device, non_blocking=True)
+        self.input_shape = self.input_example.shape
+        self.model.eval()
+        with torch.inference_mode():
+            output_example = self.model(self.input_example)
+
+        self.input_signatures = mlflow.models.infer_signature(
+            self.input_example.cpu().numpy(), output_example.cpu().numpy()
+        )
 
     def _initialize_buffers(self) -> None:
         """Initialize common buffers."""
         # Buffers that are always kept in memory, epoch-wise
-        self.buffers["Losses/Train"] = []
-        self.buffers["Losses/Validation"] = []
-        self.buffers["Hardest_example/Train"] = None
-        self.buffers["Hardest_example/Validation"] = None
+        self.buffers[Buffers.TRAIN_LOSSES] = []
+        self.buffers[Buffers.VAL_LOSSES] = []
 
     def log_model_weights_histogram(self) -> None:
         """Log the model weights histogram to Tensorboard."""
@@ -174,37 +210,65 @@ class Trainer:
         mlflow.log_artifact(str(self.output_dir.joinpath("model_summary.txt")))
         self.log_model_weights_histogram()
 
-    def _log_image(self, tag: str, image: Tensor, mode: Literal["train", "validation"]) -> None:
+    def _log_image(self, tag: str, mode: Literal["train", "validation"]) -> None:
         """Log an image to Tensorboard and MLFlow."""
         classes: list[str] | None = getattr(self.train_loader.dataset, "classes", None)
+
+        def _extract_data_from_example(
+            example: BatchExample, classes: list[str] | None
+        ) -> tuple[float, int | str, int | str, np.ndarray]:
+            """Returns the loss, the predicted class, the actual class and the image."""
+            assert example.model_output is not None
+            assert example.data is not None
+            assert example.class_id is not None
+            image = example.data.cpu().numpy()
+            if image.ndim == 1:
+                image = image.reshape(self.input_image_shape)
+            image = image.transpose(1, 2, 0)
+            logits = example.model_output
+            predicted_label = int(logits.argmax().item())  # help mypy
+            actual_label = example.class_id
+            predicted_class: int | str
+            actual_class: int | str
+            if classes is not None:
+                # If the dataset has a list of classes, use it to get the class names
+                predicted_class = classes[predicted_label]
+                actual_class = classes[actual_label]
+            else:
+                predicted_class = predicted_label
+                actual_class = actual_label
+            return example.loss_value, predicted_class, actual_class, image
+
         match mode:
             case "train":
-                h_index = self.buffers["Index_hardest_example/Train"]
-                logits_hardest_example = self.buffers["Predictions/Train"][h_index]
-                label_hardest_example = self.buffers["Labels/Train"][h_index]
-                loss = self.buffers["Losses/Train"][h_index]
+                loss_hardest_example, predicted_hardest_class, actual_hardest_class, image_hardest_example = (
+                    _extract_data_from_example(self.train_epoch_hardest_example, classes)
+                )
+                loss_easiest_example, predicted_easiest_class, actual_easiest_class, image_easiest_example = (
+                    _extract_data_from_example(self.train_epoch_easiest_example, classes)
+                )
             case "validation":
-                h_index = self.buffers["Index_hardest_example/Validation"]
-                logits_hardest_example = self.buffers["Predictions/Validation"][h_index]
-                label_hardest_example = self.buffers["Labels/Validation"][h_index]
-                loss = self.buffers["Losses/Validation"][h_index]
+                loss_hardest_example, predicted_hardest_class, actual_hardest_class, image_hardest_example = (
+                    _extract_data_from_example(self.validation_epoch_hardest_example, classes)
+                )
+                loss_easiest_example, predicted_easiest_class, actual_easiest_class, image_easiest_example = (
+                    _extract_data_from_example(self.validation_epoch_easiest_example, classes)
+                )
             case _:
                 raise ValueError(f"Unknown mode: {mode}. Use 'train' or 'validation'.")
-        if classes is not None:
-            # If the dataset has a list of classes, use it to get the class names
-            predicted_hardest_class = classes[logits_hardest_example.argmax().item()]
-            actual_hardest_class = classes[label_hardest_example.item()]
-        else:
-            predicted_hardest_class = logits_hardest_example.argmax().item()
-            actual_hardest_class = label_hardest_example.item()
-        image_array = image.cpu().numpy().transpose(1, 2, 0)
         # create image
-        fig = plt.figure(figsize=(6, 6))
-        ax = fig.add_subplot(1, 1, 1)
+        fig = plt.figure(figsize=(6, 12))
+        ax = fig.add_subplot(2, 1, 1)
+        ax2 = fig.add_subplot(2, 1, 2)
         ax.axis("off")
-        ax.imshow(image_array)
+        ax2.axis("off")
+        ax.imshow(image_hardest_example)
+        ax2.imshow(image_easiest_example)
         ax.set_title(
-            f"Actual class: {actual_hardest_class}, predicted class: {predicted_hardest_class}, loss: {loss:.2f}"
+            f"Actual class: {actual_hardest_class}, predicted class: {predicted_hardest_class}, loss: {loss_hardest_example:.2f}"
+        )
+        ax2.set_title(
+            f"Actual class: {actual_easiest_class}, predicted class: {predicted_easiest_class}, loss: {loss_easiest_example:.2f}"
         )
 
         self.summary_writer.add_figure(tag, fig, self.current_iteration, close=True)
@@ -235,7 +299,7 @@ class Trainer:
             signature=self.input_signatures,
         )
 
-    def train_one_batch(self, batch: tuple[Tensor, Tensor]) -> tuple[Tensor, Tensor, Tensor]:
+    def train_one_batch(self, batch: tuple[Tensor, Tensor]) -> None:
         """Train the model on one batch."""
         self.optimizer.zero_grad()
         inputs, labels = batch
@@ -253,51 +317,52 @@ class Trainer:
         self.optimizer.step()
 
         self.current_iteration += len(labels)
-        self.buffers["Losses/Train"].append(loss_values)
+        self.buffers[Buffers.TRAIN_LOSSES].append(loss_values)
         self.logging_counter.update_current_iteration(self.current_iteration)
 
-        hardest_example_batch = inputs[loss_values.argmax()]
+        index_hardest_example = loss_values.argmax().item()
+        index_easiest_example = loss_values.argmin().item()
+        current_hardest_loss = self.train_epoch_hardest_example.loss_value
+        current_easiest_loss = self.train_epoch_easiest_example.loss_value
+        if (h_loss := loss_values[index_hardest_example].item()) > current_hardest_loss:
+            self.train_epoch_hardest_example.loss_value = h_loss
+            self.train_epoch_hardest_example.class_id = int(labels[index_hardest_example].item())
+            self.train_epoch_hardest_example.model_output = outputs.detach()[index_hardest_example]
+            self.train_epoch_hardest_example.data = inputs[index_hardest_example]
+        if (e_loss := loss_values[index_easiest_example].item()) < current_easiest_loss:
+            self.train_epoch_easiest_example.loss_value = e_loss
+            self.train_epoch_easiest_example.class_id = int(labels[index_easiest_example].item())
+            self.train_epoch_easiest_example.model_output = outputs.detach()[index_easiest_example]
+            self.train_epoch_easiest_example.data = inputs[index_easiest_example]
 
-        return (
-            outputs.detach(),
-            labels,
-            hardest_example_batch,
-        )
+        if Buffers.TRAIN_PREDICTIONS not in self.buffers.keys() or Buffers.TRAIN_GTS not in self.buffers.keys():
+            self.buffers[Buffers.TRAIN_PREDICTIONS] = []
+            self.buffers[Buffers.TRAIN_GTS] = []
+        self.buffers[Buffers.TRAIN_PREDICTIONS].append(outputs.detach())
+        self.buffers[Buffers.TRAIN_GTS].append(labels)
 
     def train_one_epoch(self) -> None:
         """Train the model for one epoch."""
         self.model.train()
 
-        predictions: list[Tensor] = []
-        correct_labels: list[Tensor] = []
-        self.buffers["Predictions/Train"] = []
-        self.buffers["Labels/Train"] = []
-        max_loss = -math.inf
-        for batch_index, batch in enumerate(self.train_loader):
-            (batch_predictions, batch_correct_labels, hardest_example_batch) = self.train_one_batch(batch)
-            max_loss_batch = self.buffers["Losses/Train"][batch_index].max().item()
-            if max_loss_batch > max_loss:
-                max_loss = max_loss_batch
-                self.buffers["Hardest_example/Train"] = hardest_example_batch
-            predictions.append(batch_predictions)
-            correct_labels.append(batch_correct_labels)
-        self.buffers["Losses/Train"] = torch.cat(self.buffers["Losses/Train"])
-        self.buffers["Predictions/Train"] = torch.cat(predictions)
-        self.buffers["Labels/Train"] = torch.cat(correct_labels)
+        for batch in self.train_loader:
+            self.train_one_batch(batch)
         self.current_epoch += 1
-        index_hardest_example = self.buffers["Losses/Train"].argmax().item()
-        self.buffers["Index_hardest_example/Train"] = index_hardest_example
         self.update_train_metrics()
 
     def update_train_metrics(self) -> None:
         # Calculate and log only if the logging counter allows it. Except for the last epoch.
+        self.buffers[Buffers.TRAIN_LOSSES] = torch.cat(self.buffers[Buffers.TRAIN_LOSSES])
+        self.buffers[Buffers.TRAIN_PREDICTIONS] = torch.cat(self.buffers[Buffers.TRAIN_PREDICTIONS])
+        self.buffers[Buffers.TRAIN_GTS] = torch.cat(self.buffers[Buffers.TRAIN_GTS])
+
         if self.logging_counter.can_log() or self.current_epoch == self.total_epochs:
             metrics = self.calculate_metrics(
-                self.buffers["Predictions/Train"],
-                self.buffers["Labels/Train"],
+                self.buffers[Buffers.TRAIN_PREDICTIONS],
+                self.buffers[Buffers.TRAIN_GTS],
             )
 
-            train_loss = self.buffers["Losses/Train"].mean().item()
+            train_loss = self.buffers[Buffers.TRAIN_LOSSES].mean().item()
             logger.info(
                 "Epoch: %d, train loss (avg. over epoch): %.3f, train accuracy: %.2f.",
                 self.current_epoch,
@@ -313,7 +378,7 @@ class Trainer:
             self.metrics["TPs rel./Train"] = metrics["TPs (%)"]
             self.metrics["FPs rel./Train"] = metrics["FPs (%)"]
 
-    def validate_one_batch(self, batch: tuple[Tensor, Tensor]) -> tuple[Tensor, Tensor, Tensor]:
+    def validate_one_batch(self, batch: tuple[Tensor, Tensor]) -> None:
         """Train the model on one batch."""
         inputs, labels = batch
         inputs = inputs.to(self.device, non_blocking=True)
@@ -323,46 +388,51 @@ class Trainer:
         loss = self.loss_fn(outputs, labels)
         # The loss must not have been reduced yet
         assert loss.dim() == 1, f"Loss should be a vector, but got {loss.dim()} dimensions."
-        self.buffers["Losses/Validation"].append(loss)
+        self.buffers[Buffers.VAL_LOSSES].append(loss)
 
-        hardest_example_batch = inputs[loss.argmax()]
-        return (outputs, labels, hardest_example_batch)
+        index_hardest_example = loss.argmax().item()
+        index_easiest_example = loss.argmin().item()
+        current_hardest_loss = self.validation_epoch_hardest_example.loss_value
+        current_easiest_loss = self.validation_epoch_easiest_example.loss_value
+        if (h_loss := loss[index_hardest_example]) > current_hardest_loss:
+            self.validation_epoch_hardest_example.loss_value = h_loss
+            self.validation_epoch_hardest_example.class_id = int(labels[index_hardest_example].item())
+            self.validation_epoch_hardest_example.model_output = outputs[index_hardest_example]
+            self.validation_epoch_hardest_example.data = inputs[index_hardest_example]
+        if (e_loss := loss[index_easiest_example]) < current_easiest_loss:
+            self.validation_epoch_easiest_example.loss_value = e_loss
+            self.validation_epoch_easiest_example.class_id = int(labels[index_easiest_example].item())
+            self.validation_epoch_easiest_example.model_output = outputs[index_easiest_example]
+            self.validation_epoch_easiest_example.data = inputs[index_easiest_example]
+
+        if Buffers.VAL_PREDICTIONS not in self.buffers.keys() or Buffers.VAL_GTS not in self.buffers.keys():
+            self.buffers[Buffers.VAL_PREDICTIONS] = []
+            self.buffers[Buffers.VAL_GTS] = []
+        self.buffers[Buffers.VAL_PREDICTIONS].append(outputs.detach())
+        self.buffers[Buffers.VAL_GTS].append(labels)
 
     def validate_one_epoch(self) -> None:
         """Run validation on one epoch."""
         assert self.val_loader is not None, "Validation loader is not set. Cannot validate."
         self.model.eval()
 
-        self.buffers["Predictions/Validation"] = None
-        self.buffers["Labels/Validation"] = None
-        max_loss = -math.inf
         with torch.inference_mode():
-            predictions: list[Tensor] = []
-            correct_labels: list[Tensor] = []
-            for batch_index, batch in enumerate(self.val_loader):
-                (batch_predictions, batch_labels, hardest_example_batch) = self.validate_one_batch(batch)
-                max_loss_batch = self.buffers["Losses/Validation"][batch_index].max().item()
-                if max_loss_batch > max_loss:
-                    max_loss = max_loss_batch
-                    self.buffers["Hardest_example/Validation"] = hardest_example_batch
-                predictions.append(batch_predictions)
-                correct_labels.append(batch_labels)
-            self.buffers["Losses/Validation"] = torch.cat(self.buffers["Losses/Validation"])
-            self.buffers["Predictions/Validation"] = torch.cat(predictions)
-            self.buffers["Labels/Validation"] = torch.cat(correct_labels)
-            index_hardest_example = self.buffers["Losses/Validation"].argmax().item()
-            self.buffers["Index_hardest_example/Validation"] = index_hardest_example
+            for batch in self.val_loader:
+                self.validate_one_batch(batch)
             self.update_validation_metrics()
 
     def update_validation_metrics(self) -> None:
         # Calculate and log only if the logging counter allows it. Except for the last epoch.
+        self.buffers[Buffers.VAL_LOSSES] = torch.cat(self.buffers[Buffers.VAL_LOSSES])
+        self.buffers[Buffers.VAL_PREDICTIONS] = torch.cat(self.buffers[Buffers.VAL_PREDICTIONS])
+        self.buffers[Buffers.VAL_GTS] = torch.cat(self.buffers[Buffers.VAL_GTS])
         if self.logging_counter.can_log() or self.current_epoch == self.total_epochs:
             # Log
             metrics = self.calculate_metrics(
-                self.buffers["Predictions/Validation"],
-                self.buffers["Labels/Validation"],
+                self.buffers[Buffers.VAL_PREDICTIONS],
+                self.buffers[Buffers.VAL_GTS],
             )
-            validation_loss = self.buffers["Losses/Validation"].mean().item()
+            validation_loss = self.buffers[Buffers.VAL_LOSSES].mean().item()
             logger.info(
                 "Epoch: %d, validation loss (avg. over epoch): %.3f, validation accuracy: %.2f.",
                 self.current_epoch,
@@ -392,6 +462,10 @@ class Trainer:
             self.metrics = {}
             self.buffers = {}
             self._initialize_buffers()
+            self.train_epoch_hardest_example = BatchExample(loss_value=-math.inf)
+            self.train_epoch_easiest_example = BatchExample(loss_value=math.inf)
+            self.validation_epoch_hardest_example = BatchExample(loss_value=-math.inf)
+            self.validation_epoch_easiest_example = BatchExample(loss_value=math.inf)
             # Log tensorboard artifacts in MLFlow
             mlflow.log_artifact(str(self.tensorboard_log_dir))
         logger.info("Training finished.")
@@ -438,54 +512,79 @@ class Trainer:
         mlflow.log_metrics(self.metrics, step=self.current_iteration)
 
         # Log buffers
-        hardest_train = self.buffers.get("Hardest_example/Train")
-        hardest_val = self.buffers.get("Hardest_example/Validation")
-        if hardest_train is not None:
-            hardest_train = hardest_train.reshape(self.input_image_shape)
+        if self.train_epoch_hardest_example.data is not None:
             # Log the image
-            self._log_image("Hardest_example/Train", hardest_train, "train")
-        if hardest_val is not None:
-            hardest_val = hardest_val.reshape(self.input_image_shape)
-            self._log_image("Hardest_example/Validation", hardest_val, "validation")
+            self._log_image("Hardest_and_easiest_examples/Train", "train")
+        if self.validation_epoch_hardest_example.data is not None:
+            self._log_image("Hardest_and_easiest_examples/Validation", "validation")
 
 
 class AETrainer(Trainer):
     """Trainer class for an autoencoder."""
 
-    def _log_image(self, tag: str, image: Tensor, mode: Literal["train", "validation"]) -> None:
+    def _log_image(self, tag: str, mode: Literal["train", "validation"]) -> None:
         """Log an image to Tensorboard and MLFlow."""
         classes: list[str] | None = getattr(self.train_loader.dataset, "classes", None)
+
+        def _extract_data_from_example(
+            example: BatchExample, classes: list[str] | None
+        ) -> tuple[float, int | str, np.ndarray, np.ndarray]:
+            """Returns the loss, the actual class and the reconstruced image and the actual image."""
+            assert example.model_output is not None
+            assert example.data is not None
+            assert example.class_id is not None
+            image = example.data.cpu().numpy().transpose(1, 2, 0)
+            reconstructed_image = example.model_output.cpu().numpy().transpose(1, 2, 0)
+            actual_label = example.class_id
+            actual_class: int | str
+            if classes is not None:
+                actual_class = classes[actual_label]
+            else:
+                actual_class = actual_label
+            return example.loss_value, actual_class, image, reconstructed_image
+
         match mode:
             case "train":
-                h_index = self.buffers["Index_hardest_example/Train"]
-                label_hardest_example = self.buffers["Labels/Train"][h_index]
-                loss = self.buffers["Losses/Train"][h_index]
-                reconstructed_image = self.buffers["Predictions/Train"][h_index]
+                loss_hardest_example, actual_hardest_class, hardest_image, reconstructed_hardest_image = (
+                    _extract_data_from_example(self.train_epoch_hardest_example, classes)
+                )
+                loss_easiest_example, actual_easiest_class, easiest_image, reconstructed_easiest_image = (
+                    _extract_data_from_example(self.train_epoch_easiest_example, classes)
+                )
             case "validation":
-                h_index = self.buffers["Index_hardest_example/Validation"]
-                label_hardest_example = self.buffers["Labels/Validation"][h_index]
-                loss = self.buffers["Losses/Validation"][h_index]
-                reconstructed_image = self.buffers["Predictions/Validation"][h_index]
+                loss_hardest_example, actual_hardest_class, hardest_image, reconstructed_hardest_image = (
+                    _extract_data_from_example(self.validation_epoch_hardest_example, classes)
+                )
+                loss_easiest_example, actual_easiest_class, easiest_image, reconstructed_easiest_image = (
+                    _extract_data_from_example(self.validation_epoch_easiest_example, classes)
+                )
             case _:
                 raise ValueError(f"Unknown mode: {mode}. Use 'train' or 'validation'.")
-        if classes is not None:
-            # If the dataset has a list of classes, use it to get the class names
-            actual_hardest_class = classes[label_hardest_example.item()]
-        else:
-            actual_hardest_class = label_hardest_example.item()
 
-        original_image_array = image.cpu().numpy().transpose(1, 2, 0)
-        reconstructed_image_array = reconstructed_image.cpu().numpy().transpose(1, 2, 0)
-        l1_dist = np.abs(original_image_array - reconstructed_image_array).mean()
+        l1_dist_h = np.abs(hardest_image - reconstructed_hardest_image).mean()
+        l1_dist_e = np.abs(easiest_image - reconstructed_easiest_image).mean()
         # create image
-        fig = plt.figure(figsize=(12, 6))
-        ax = fig.add_subplot(1, 2, 1)
-        ax2 = fig.add_subplot(1, 2, 2)
+        fig = plt.figure(figsize=(12, 12))
+        ax = fig.add_subplot(2, 2, 1)
+        ax2 = fig.add_subplot(2, 2, 2)
+        axe = fig.add_subplot(2, 2, 3)
+        ax2e = fig.add_subplot(2, 2, 4)
         ax.axis("off")
         ax2.axis("off")
-        ax.imshow(reconstructed_image_array)
-        ax2.imshow(original_image_array)
-        ax.set_title(f"Loss: {loss:.2f}, l1 distance: {l1_dist:.2f}, class: {actual_hardest_class}.")
+        axe.axis("off")
+        ax2e.axis("off")
+        ax.imshow(reconstructed_hardest_image)
+        ax2.imshow(hardest_image)
+        axe.imshow(reconstructed_easiest_image)
+        ax2e.imshow(easiest_image)
+        ax.set_title("Reconstructed hardest example")
+        ax2.set_title(
+            f"Hardest loss: {loss_hardest_example:.2f}, l1 distance: {l1_dist_h:.2f}, class: {actual_hardest_class}."
+        )
+        axe.set_title("Reconstructed easiest example")
+        ax2e.set_title(
+            f"Easiest loss: {loss_easiest_example:.2f}, l1 distance: {l1_dist_e:.2f}, class: {actual_easiest_class}."
+        )
 
         self.summary_writer.add_figure(tag, fig, self.current_iteration, close=True)
         mlflow.log_figure(fig, tag + f"/Iter_{self.current_iteration}.png")
@@ -494,8 +593,9 @@ class AETrainer(Trainer):
 
     def update_train_metrics(self) -> None:
         # Calculate and log only if the logging counter allows it. Except for the last epoch.
+        self.buffers[Buffers.TRAIN_LOSSES] = torch.cat(self.buffers[Buffers.TRAIN_LOSSES])
         if self.logging_counter.can_log() or self.current_epoch == self.total_epochs:
-            train_loss = self.buffers["Losses/Train"].mean().item()
+            train_loss = self.buffers[Buffers.TRAIN_LOSSES].mean().item()
             logger.info(
                 "Epoch: %d, train loss (avg. over epoch): %.3f.",
                 self.current_epoch,
@@ -507,9 +607,10 @@ class AETrainer(Trainer):
 
     def update_validation_metrics(self) -> None:
         # Calculate and log only if the logging counter allows it. Except for the last epoch.
+        self.buffers[Buffers.VAL_LOSSES] = torch.cat(self.buffers[Buffers.VAL_LOSSES])
         if self.logging_counter.can_log() or self.current_epoch == self.total_epochs:
             # Log
-            validation_loss = self.buffers["Losses/Validation"].mean().item()
+            validation_loss = self.buffers[Buffers.VAL_LOSSES].mean().item()
             logger.info(
                 "Epoch: %d, validation loss (avg. over epoch): %.3f.",
                 self.current_epoch,
@@ -519,7 +620,7 @@ class AETrainer(Trainer):
             # Store epoch metrics
             self.metrics["Loss/Validation"] = validation_loss
 
-    def train_one_batch(self, batch: tuple[Tensor, Tensor]) -> tuple[Tensor, Tensor, Tensor]:
+    def train_one_batch(self, batch: tuple[Tensor, Tensor]) -> None:
         """Train the model on one batch."""
         self.optimizer.zero_grad()
         inputs, labels = batch
@@ -537,18 +638,25 @@ class AETrainer(Trainer):
         self.optimizer.step()
 
         self.current_iteration += len(labels)
-        self.buffers["Losses/Train"].append(loss_values)
+        self.buffers[Buffers.TRAIN_LOSSES].append(loss_values)
         self.logging_counter.update_current_iteration(self.current_iteration)
 
-        hardest_example_batch = inputs[loss_values.argmax()]
+        index_hardest_example = loss_values.argmax().item()
+        index_easiest_example = loss_values.argmin().item()
+        current_hardest_loss = self.train_epoch_hardest_example.loss_value
+        current_easiest_loss = self.train_epoch_easiest_example.loss_value
+        if (h_loss := loss_values[index_hardest_example].item()) > current_hardest_loss:
+            self.train_epoch_hardest_example.loss_value = h_loss
+            self.train_epoch_hardest_example.class_id = int(labels[index_hardest_example].item())
+            self.train_epoch_hardest_example.model_output = outputs.detach()[index_hardest_example]
+            self.train_epoch_hardest_example.data = inputs[index_hardest_example]
+        if (e_loss := loss_values[index_easiest_example].item()) < current_easiest_loss:
+            self.train_epoch_easiest_example.loss_value = e_loss
+            self.train_epoch_easiest_example.class_id = int(labels[index_easiest_example].item())
+            self.train_epoch_easiest_example.model_output = outputs.detach()[index_easiest_example]
+            self.train_epoch_easiest_example.data = inputs[index_easiest_example]
 
-        return (
-            outputs.detach(),
-            labels,
-            hardest_example_batch,
-        )
-
-    def validate_one_batch(self, batch: tuple[Tensor, Tensor]) -> tuple[Tensor, Tensor, Tensor]:
+    def validate_one_batch(self, batch: tuple[Tensor, Tensor]) -> None:
         """Train the model on one batch."""
         inputs, labels = batch
         inputs = inputs.to(self.device, non_blocking=True)
@@ -558,29 +666,53 @@ class AETrainer(Trainer):
         loss = self.loss_fn(outputs, inputs).mean(axis=(1, 2, 3))
         # The loss must not have been reduced yet
         assert loss.dim() == 1, f"Loss should be a vector, but got {loss.dim()} dimensions."
-        self.buffers["Losses/Validation"].append(loss)
+        self.buffers[Buffers.VAL_LOSSES].append(loss)
 
-        hardest_example_batch = inputs[loss.argmax()]
-        return (outputs, labels, hardest_example_batch)
+        index_hardest_example = loss.argmax().item()
+        index_easiest_example = loss.argmin().item()
+        current_hardest_loss = self.validation_epoch_hardest_example.loss_value
+        current_easiest_loss = self.validation_epoch_easiest_example.loss_value
+        if (h_loss := loss[index_hardest_example]) > current_hardest_loss:
+            self.validation_epoch_hardest_example.loss_value = h_loss
+            self.validation_epoch_hardest_example.class_id = int(labels[index_hardest_example].item())
+            self.validation_epoch_hardest_example.model_output = outputs[index_hardest_example]
+            self.validation_epoch_hardest_example.data = inputs[index_hardest_example]
+        if (e_loss := loss[index_easiest_example]) < current_easiest_loss:
+            self.validation_epoch_easiest_example.loss_value = e_loss
+            self.validation_epoch_easiest_example.class_id = int(labels[index_easiest_example].item())
+            self.validation_epoch_easiest_example.model_output = outputs[index_easiest_example]
+            self.validation_epoch_easiest_example.data = inputs[index_easiest_example]
 
 
 class VAETrainer(AETrainer):
     """Trainer for a variational autoencoder."""
 
+    def _initialize_model_signature(self) -> None:
+        """Define the mlflow model signature."""
+        self.input_example = next(iter(self.train_loader))[0].to(self.device, non_blocking=True)
+        self.input_shape: tuple[int, ...] = self.input_example.shape
+        self.model.eval()
+        with torch.inference_mode():
+            mean, log_var, output_example = self.model(self.input_example)
+
+        self.input_signatures = mlflow.models.infer_signature(
+            self.input_example.cpu().numpy(), (mean.cpu().numpy(), log_var.cpu().numpy(), output_example.cpu().numpy())
+        )
+
     def _initialize_buffers(self) -> None:
         """Initialize common buffers."""
         super()._initialize_buffers()
-        self.buffers["Reconstruction_Losses/Train"] = []
-        self.buffers["Reconstruction_Losses/Validation"] = []
-        self.buffers["KL_Losses/Train"] = []
-        self.buffers["KL_Losses/Validation"] = []
+        self.buffers[Buffers.TRAIN_RECONSTRUCTION_LOSSES] = []
+        self.buffers[Buffers.VAL_RECONSTRUCTION_LOSSES] = []
+        self.buffers[Buffers.TRAIN_KL_LOSSES] = []
+        self.buffers[Buffers.VAL_KL_LOSSES] = []
 
-    def _log_image(self, tag: str, image: Tensor, mode: Literal["train", "validation"]) -> None:
+    def _log_image(self, tag: str, mode: Literal["train", "validation"]) -> None:
         """Log an image to Tensorboard and MLFlow."""
-        super()._log_image(tag, image, mode)
+        super()._log_image(tag, mode)
         # log a sampled output
         with torch.inference_mode():
-            embeddings_dim = self.model.config["model"]["embeddings_dim"]
+            embeddings_dim: int = self.model.config["model"]["embeddings_dim"]
             z = torch.randn((2, embeddings_dim), device=self.device)
             generated_images = self.model.decoder(z).cpu().numpy().transpose((0, 2, 3, 1))
         fig = plt.figure(figsize=(12, 6))
@@ -597,7 +729,7 @@ class VAETrainer(AETrainer):
         self.summary_writer.add_figure(tag, fig, self.current_iteration, close=True)
         mlflow.log_figure(fig, tag + f"/Iter_{self.current_iteration}.png")
 
-    def train_one_batch(self, batch: tuple[Tensor, Tensor]) -> tuple[Tensor, Tensor, Tensor]:
+    def train_one_batch(self, batch: tuple[Tensor, Tensor]) -> None:
         """Train the model on one batch."""
         self.optimizer.zero_grad()
         inputs, labels = batch
@@ -616,20 +748,27 @@ class VAETrainer(AETrainer):
         self.optimizer.step()
 
         self.current_iteration += len(labels)
-        self.buffers["Losses/Train"].append(loss_values)
-        self.buffers["Reconstruction_Losses/Train"].append(rec_loss.detach())
-        self.buffers["KL_Losses/Train"].append(kl_loss.detach())
+        self.buffers[Buffers.TRAIN_LOSSES].append(loss_values)
+        self.buffers[Buffers.TRAIN_RECONSTRUCTION_LOSSES].append(rec_loss.detach())
+        self.buffers[Buffers.TRAIN_KL_LOSSES].append(kl_loss.detach())
         self.logging_counter.update_current_iteration(self.current_iteration)
 
-        hardest_example_batch = inputs[loss_values.argmax()]
+        index_hardest_example = loss_values.argmax().item()
+        index_easiest_example = loss_values.argmin().item()
+        current_hardest_loss = self.train_epoch_hardest_example.loss_value
+        current_easiest_loss = self.train_epoch_easiest_example.loss_value
+        if (h_loss := loss_values[index_hardest_example].item()) > current_hardest_loss:
+            self.train_epoch_hardest_example.loss_value = h_loss
+            self.train_epoch_hardest_example.class_id = int(labels[index_hardest_example].item())
+            self.train_epoch_hardest_example.model_output = outputs.detach()[index_hardest_example]
+            self.train_epoch_hardest_example.data = inputs[index_hardest_example]
+        if (e_loss := loss_values[index_easiest_example].item()) < current_easiest_loss:
+            self.train_epoch_easiest_example.loss_value = e_loss
+            self.train_epoch_easiest_example.class_id = int(labels[index_easiest_example].item())
+            self.train_epoch_easiest_example.model_output = outputs.detach()[index_easiest_example]
+            self.train_epoch_easiest_example.data = inputs[index_easiest_example]
 
-        return (
-            outputs.detach(),
-            labels,
-            hardest_example_batch,
-        )
-
-    def validate_one_batch(self, batch: tuple[Tensor, Tensor]) -> tuple[Tensor, Tensor, Tensor]:
+    def validate_one_batch(self, batch: tuple[Tensor, Tensor]) -> None:
         """Train the model on one batch."""
         inputs, labels = batch
         inputs = inputs.to(self.device, non_blocking=True)
@@ -639,37 +778,49 @@ class VAETrainer(AETrainer):
         rec_loss, kl_loss, loss = self.loss_fn(outputs, inputs, mean, log_var)
         # The loss must not have been reduced yet
         assert loss.dim() == 1, f"Loss should be a vector, but got {loss.dim()} dimensions."
-        self.buffers["Losses/Validation"].append(loss)
-        self.buffers["Reconstruction_Losses/Validation"].append(rec_loss)
-        self.buffers["KL_Losses/Validation"].append(kl_loss)
+        self.buffers[Buffers.VAL_LOSSES].append(loss)
+        self.buffers[Buffers.VAL_RECONSTRUCTION_LOSSES].append(rec_loss)
+        self.buffers[Buffers.VAL_KL_LOSSES].append(kl_loss)
 
-        hardest_example_batch = inputs[loss.argmax()]
-        return (outputs, labels, hardest_example_batch)
+        index_hardest_example = loss.argmax().item()
+        index_easiest_example = loss.argmin().item()
+        current_hardest_loss = self.validation_epoch_hardest_example.loss_value
+        current_easiest_loss = self.validation_epoch_easiest_example.loss_value
+        if (h_loss := loss[index_hardest_example]) > current_hardest_loss:
+            self.validation_epoch_hardest_example.loss_value = h_loss
+            self.validation_epoch_hardest_example.class_id = int(labels[index_hardest_example].item())
+            self.validation_epoch_hardest_example.model_output = outputs[index_hardest_example]
+            self.validation_epoch_hardest_example.data = inputs[index_hardest_example]
+        if (e_loss := loss[index_easiest_example]) < current_easiest_loss:
+            self.validation_epoch_easiest_example.loss_value = e_loss
+            self.validation_epoch_easiest_example.class_id = int(labels[index_easiest_example].item())
+            self.validation_epoch_easiest_example.model_output = outputs[index_easiest_example]
+            self.validation_epoch_easiest_example.data = inputs[index_easiest_example]
 
     def update_train_metrics(self) -> None:
         # Calculate and log only if the logging counter allows it. Except for the last epoch.
         super().update_train_metrics()
-        self.buffers["Reconstruction_Losses/Train"] = torch.cat(self.buffers["Reconstruction_Losses/Train"])
-        self.buffers["KL_Losses/Train"] = torch.cat(self.buffers["KL_Losses/Train"])
+        self.buffers[Buffers.TRAIN_RECONSTRUCTION_LOSSES] = torch.cat(self.buffers[Buffers.TRAIN_RECONSTRUCTION_LOSSES])
+        self.buffers[Buffers.TRAIN_KL_LOSSES] = torch.cat(self.buffers[Buffers.TRAIN_KL_LOSSES])
         if self.logging_counter.can_log() or self.current_epoch == self.total_epochs:
-            rec_loss = self.buffers["Reconstruction_Losses/Train"].mean().item()
-            kl_loss = self.buffers["KL_Losses/Train"].mean().item()
+            rec_loss = self.buffers[Buffers.TRAIN_RECONSTRUCTION_LOSSES].mean().item()
+            kl_loss = self.buffers[Buffers.TRAIN_KL_LOSSES].mean().item()
             logger.info("Epoch: %d, rec loss: %.3f, kl loss: %.3f.", self.current_epoch, rec_loss, kl_loss)
 
             # Store epoch metrics
-            self.metrics["Reconstruction_Loss/Train"] = rec_loss
-            self.metrics["KL_Loss/Train"] = kl_loss
+            self.metrics[Buffers.TRAIN_RECONSTRUCTION_LOSSES] = rec_loss
+            self.metrics[Buffers.TRAIN_KL_LOSSES] = kl_loss
 
     def update_validation_metrics(self) -> None:
         # Calculate and log only if the logging counter allows it. Except for the last epoch.
         super().update_validation_metrics()
-        self.buffers["Reconstruction_Losses/Validation"] = torch.cat(self.buffers["Reconstruction_Losses/Validation"])
-        self.buffers["KL_Losses/Validation"] = torch.cat(self.buffers["KL_Losses/Validation"])
+        self.buffers[Buffers.VAL_RECONSTRUCTION_LOSSES] = torch.cat(self.buffers[Buffers.VAL_RECONSTRUCTION_LOSSES])
+        self.buffers[Buffers.VAL_KL_LOSSES] = torch.cat(self.buffers[Buffers.VAL_KL_LOSSES])
         if self.logging_counter.can_log() or self.current_epoch == self.total_epochs:
-            rec_loss = self.buffers["Reconstruction_Losses/Validation"].mean().item()
+            rec_loss = self.buffers[Buffers.VAL_RECONSTRUCTION_LOSSES].mean().item()
             kl_loss = self.buffers["KL_Losses/Validation"].mean().item()
             logger.info("Epoch: %d, rec loss: %.3f, kl loss: %.3f.", self.current_epoch, rec_loss, kl_loss)
 
             # Store epoch metrics
-            self.metrics["Reconstruction_Loss/Validation"] = rec_loss
-            self.metrics["KL_Loss/Validation"] = kl_loss
+            self.metrics[Buffers.VAL_RECONSTRUCTION_LOSSES] = rec_loss
+            self.metrics[Buffers.VAL_KL_LOSSES] = kl_loss
