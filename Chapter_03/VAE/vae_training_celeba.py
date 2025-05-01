@@ -201,8 +201,14 @@ def main(cfg: DictConfig) -> None:
 
     # Prepare data loaders
     data_cfg = cfg.data
+    resize_size = cfg.model.input_size[1:]
+    mult = 2 ** len(cfg.model.encoder_number_of_channels)
+    for size in resize_size:
+        if not size % mult == 0:
+            raise ValueError(f"The input shape must be divisible by {mult}. Got {resize_size}.")
+
     train_loader, val_loader = get_dataloaders(
-        data_cfg.batch_size, data_cfg.pin_memory, data_cfg.num_workers, data_cfg.shuffle, cfg.model.input_size[1:]
+        data_cfg.batch_size, data_cfg.pin_memory, data_cfg.num_workers, data_cfg.shuffle, resize_size
     )
     # Prepare the model
     model = VariationalAutoEncoder(
