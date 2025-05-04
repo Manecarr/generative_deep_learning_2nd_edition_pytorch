@@ -68,21 +68,20 @@ class SamplingLayer(torch.nn.Module):
         """Perform the sampling.
 
         Args:
-            inputs: the mean and log variance of the normal distribution.
+            inputs: the mean and variance of the normal distribution.
 
         Returns:
             the sample from the distribution.
         """
         device = inputs[0].device
-        mean, log_var = inputs
+        mean, var = inputs
         with device:
             epsilon = torch.randn(mean.size())
-        sigma = torch.exp(log_var / 2)
-        return mean + sigma * epsilon
+        return mean + torch.sqrt(var) * epsilon
 
 
 class MeanVariancePredictor(torch.nn.Module):
-    """Return the learned mean and log variance of a normal distribution."""
+    """Return the learned mean and variance of a normal distribution."""
 
     def __init__(self, input_size: int, embedding_input_size: int) -> None:
         """Initialize the model."""
@@ -94,7 +93,8 @@ class MeanVariancePredictor(torch.nn.Module):
         """Perform the forward pass."""
         mean = self.normal_mean(embeddings)
         log_var = self.normal_log_var(embeddings)
-        return mean, log_var
+        var = torch.exp(log_var)
+        return mean, var
 
 
 class VariationalAutoEncoder(torch.nn.Module):

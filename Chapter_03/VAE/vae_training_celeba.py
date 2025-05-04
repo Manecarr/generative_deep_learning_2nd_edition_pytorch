@@ -9,6 +9,7 @@ import hydra
 import mlflow
 from omegaconf import DictConfig
 import torch
+from torch.distributions import MultivariateNormal
 from torchvision.transforms.v2 import Compose, Resize, ToDtype, ToImage
 
 from utils.data.datasets import DATA_CACHE_DIR, get_celeb_a_dataset
@@ -74,37 +75,33 @@ def get_dataloaders(
 class SamplingLayer(torch.nn.Module):
     """Implement the sampling from a multivariate normal distribution."""
 
-    def forward(self, inputs: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+    def forward(self, distr: MultivariateNormal) -> torch.Tensor:
         """Perform the sampling.
 
         Args:
-            inputs: the mean and log variance of the normal distribution.
+            distr: the distribution from where to sample.
 
         Returns:
             the sample from the distribution.
         """
-        device = inputs[0].device
-        mean, log_var = inputs
-        with device:
-            epsilon = torch.randn(mean.size())
-        sigma = torch.exp(log_var / 2)
-        return mean + sigma * epsilon
+        return distr.rsample()
 
 
 class MeanVariancePredictor(torch.nn.Module):
-    """Return the learned mean and log variance of a normal distribution."""
+    """Return the learned mean and variance of a normal distribution."""
 
     def __init__(self, input_size: int, embedding_input_size: int) -> None:
         """Initialize the model."""
         super().__init__()
-        self.normal_mean = torch.nn.Linear(input_size, embedding_input_size)
-        self.normal_log_var = torch.nn.Linear(input_size, embedding_input_size)
+        self.embeddings_input_size = embedding_input_size
+        self.statistics = torch.nn.Linear(input_size, 2 * embedding_input_size)
 
     def forward(self, embeddings: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Perform the forward pass."""
-        mean = self.normal_mean(embeddings)
-        log_var = self.normal_log_var(embeddings)
-        return mean, log_var
+        stats = self.statistics(embeddings)
+        mean, log_var = torch.split(stats, self.embeddings_input_size, dim=1)
+        var = torch.exp(log_var)
+        return mean, var
 
 
 class VariationalAutoEncoder(torch.nn.Module):
@@ -183,10 +180,10 @@ class VariationalAutoEncoder(torch.nn.Module):
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Perform the forward pass."""
-        mean, log_var = self.encoder(x)
-        embeddings = self.sampler((mean, log_var))
+        mean, var = self.encoder(x)
+        embeddings = self.sampler(MultivariateNormal(mean, scale_tril=torch.diag_embed(var + 1e-6)))
         decoder_out = self.decoder(embeddings)
-        return mean, log_var, decoder_out
+        return mean, var, decoder_out
 
 
 @hydra.main(config_path="config", config_name="config_celeba")

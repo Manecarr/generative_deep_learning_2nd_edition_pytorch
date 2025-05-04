@@ -1,6 +1,7 @@
 from collections.abc import Callable
 
 import torch
+from torch.distributions import MultivariateNormal, kl_divergence
 from torch.nn.modules.loss import _Loss
 
 
@@ -20,9 +21,12 @@ class Lambda(torch.nn.Module):
 class KLNormalLoss(_Loss):
     """The KL divergence between a normal distributions and the standard normal."""
 
-    def forward(self, mean: torch.Tensor, log_var: torch.Tensor) -> torch.Tensor:
+    def forward(self, mean: torch.Tensor, var: torch.Tensor) -> torch.Tensor:
         """Calculate the loss."""
-        loss = -0.5 * torch.sum(1 + log_var - torch.square(mean) - torch.exp(log_var), dim=1)
+        # Batch size can change in the last epoch. These distributions need to be instantiated dynamically.
+        std_normal = MultivariateNormal(torch.zeros_like(mean), scale_tril=torch.diag_embed(torch.ones_like(mean)))
+        distr = MultivariateNormal(mean, scale_tril=torch.diag_embed(var + 1e-6))
+        loss = kl_divergence(distr, std_normal)
         if self.reduction == "none":
             return loss
         elif self.reduction == "mean":
@@ -51,10 +55,10 @@ class VAELoss(torch.nn.Module):
         self.kl_loss = KLNormalLoss(reduction="none")
 
     def forward(
-        self, preds: torch.Tensor, gts: torch.Tensor, mean: torch.Tensor, log_var: torch.Tensor
+        self, preds: torch.Tensor, gts: torch.Tensor, mean: torch.Tensor, var: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Calculate the loss."""
         rec_loss = self.rec_loss(preds, gts).mean(axis=(1, 2, 3))
-        kl_loss = self.kl_loss(mean, log_var)
+        kl_loss = self.kl_loss(mean, var)
         loss = self.rec_w * rec_loss + self.kl_w * kl_loss
         return rec_loss, kl_loss, loss

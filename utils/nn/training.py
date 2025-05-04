@@ -693,10 +693,10 @@ class VAETrainer(AETrainer):
         self.input_shape: tuple[int, ...] = self.input_example.shape
         self.model.eval()
         with torch.inference_mode():
-            mean, log_var, output_example = self.model(self.input_example)
+            mean, var, output_example = self.model(self.input_example)
 
         self.input_signatures = mlflow.models.infer_signature(
-            self.input_example.cpu().numpy(), (mean.cpu().numpy(), log_var.cpu().numpy(), output_example.cpu().numpy())
+            self.input_example.cpu().numpy(), (mean.cpu().numpy(), var.cpu().numpy(), output_example.cpu().numpy())
         )
 
     def _initialize_buffers(self) -> None:
@@ -736,8 +736,8 @@ class VAETrainer(AETrainer):
         inputs = inputs.to(self.device, non_blocking=True)
         labels = labels.to(self.device, non_blocking=True)
 
-        mean, log_var, outputs = self.model(inputs)
-        rec_loss, kl_loss, loss = self.loss_fn(outputs, inputs, mean, log_var)
+        mean, var, outputs = self.model(inputs)
+        rec_loss, kl_loss, loss = self.loss_fn(outputs, inputs, mean, var)
         rec_loss = rec_loss.detach()
         loss_values = loss.detach()
         # The loss must not have been reduced yet
@@ -774,8 +774,8 @@ class VAETrainer(AETrainer):
         inputs = inputs.to(self.device, non_blocking=True)
         labels = labels.to(self.device, non_blocking=True)
 
-        mean, log_var, outputs = self.model(inputs)
-        rec_loss, kl_loss, loss = self.loss_fn(outputs, inputs, mean, log_var)
+        mean, var, outputs = self.model(inputs)
+        rec_loss, kl_loss, loss = self.loss_fn(outputs, inputs, mean, var)
         # The loss must not have been reduced yet
         assert loss.dim() == 1, f"Loss should be a vector, but got {loss.dim()} dimensions."
         self.buffers[Buffers.VAL_LOSSES].append(loss)
