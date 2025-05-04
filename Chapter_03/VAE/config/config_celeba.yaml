@@ -4,13 +4,13 @@ hydra:
 data:
   pin_memory: True
   num_workers: 8
-  batch_size: 8
+  batch_size: 256
   shuffle: True
 model:
-  input_image_shape: [3, 52, 32]
+  input_image_shape: [3, 32, 32]
   input_size:
     - 3
-    - 52
+    - 32
     - 32
   encoder_number_of_channels:
     - 128
@@ -45,7 +45,7 @@ model:
   embeddings_dim: 200
 optimizer:
   type: torch.optim.Adam
-  lr: 0.0005
+  lr: 0.005
 loss_function:
   type: utils.nn.modules.VAELoss
   weights:
